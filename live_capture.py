@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from statistics import median
 
 import chess
 from PIL import Image, ImageOps, ImageStat
@@ -108,6 +109,13 @@ def board_crop(image: Image.Image, box: tuple[int, int, int, int]) -> Image.Imag
     return cropped
 
 
+def reduce_glare(image: Image.Image) -> Image.Image:
+    """Compress bright SDR preview values without changing Windows HDR settings."""
+    lut = [value if value <= 180 else round(180 + (value - 180) * .6)
+           for value in range(256)]
+    return image.convert("RGB").point(lut * 3)
+
+
 def _cell_signature(cell: Image.Image) -> bytes:
     cell = ImageOps.grayscale(cell.crop((6, 6, 58, 58)))
     pixels = list(cell.resize((26, 26), Image.Resampling.BILINEAR).tobytes())
@@ -129,11 +137,12 @@ def _signature(image: Image.Image, flipped: bool) -> list[bytes]:
     return signatures
 
 
-@lru_cache(maxsize=1)
-def _piece_templates() -> dict[bool, dict[str, bytes]]:
+@lru_cache(maxsize=16)
+def _piece_templates(light: tuple[int, int, int],
+                     dark: tuple[int, int, int]) -> dict[bool, dict[str, bytes]]:
     sprites = Path(__file__).resolve().parent / "pieces"
     result = {}
-    for dark, background in ((False, "#f0d9b5"), (True, "#b58863")):
+    for is_dark, background in ((False, light), (True, dark)):
         templates = {".": _cell_signature(Image.new("RGB", (64, 64), background))}
         for color in "wb":
             for symbol in "PNBRQK":
@@ -141,20 +150,36 @@ def _piece_templates() -> dict[bool, dict[str, bytes]]:
                 cell = Image.new("RGB", (64, 64), background)
                 cell.paste(sprite, (0, 0), sprite)
                 templates[symbol if color == "w" else symbol.lower()] = _cell_signature(cell)
-        result[dark] = templates
+        result[is_dark] = templates
     return result
+
+
+def _square_backgrounds(image: Image.Image, flipped: bool) -> tuple[tuple[int, int, int], ...]:
+    image = image.resize((512, 512), Image.Resampling.BILINEAR).convert("RGB")
+    samples: dict[bool, list[tuple[int, int, int]]] = {False: [], True: []}
+    for row in range(8):
+        for col in range(8):
+            file_ = 7 - col if flipped else col
+            rank = row if flipped else 7 - row
+            dark = (file_ + rank) % 2 == 0
+            samples[dark].append(image.getpixel((col * 64 + 4, row * 64 + 4)))
+    return tuple(tuple(round(median(pixel[channel] for pixel in samples[dark]))
+                       for channel in range(3)) for dark in (False, True))
 
 
 def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> chess.Board:
     """Read a Neo board from a captured image; fail on ambiguous squares."""
-    templates = _piece_templates()
+    backgrounds = _square_backgrounds(image, flipped)
+    templates = _piece_templates(*backgrounds)
+    # White pieces can have very small margins against clipped HDR whites.
+    min_margin = 0.4 if min(backgrounds[0]) >= 245 else 3
     position = chess.Board(None)
     for square, signature in enumerate(_signature(image, flipped)):
         dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
         scores = sorted((_difference(signature, sample), symbol)
                         for symbol, sample in templates[dark].items())
         (distance, symbol), (second, _) = scores[:2]
-        if distance > 24 or second - distance < 3:
+        if distance > 35 or second - distance < min_margin:
             raise ValueError(f"Không nhận rõ quân ở ô {chess.square_name(square)}; "
                              "hãy khoanh sát bàn cờ và dùng bộ quân Neo.")
         if symbol != ".":

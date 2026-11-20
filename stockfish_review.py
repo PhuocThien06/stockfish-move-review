@@ -33,7 +33,7 @@ from coach import explain_move
 from grade_badges import draw_badge, make_badge, text_color
 from local_store import load_favorites, prune_old_games, save_favorites
 from live_capture import (LiveBoardTracker, WindowCaptureStream, board_crop,
-                          recognize_board, visible_windows)
+                          recognize_board, reduce_glare, visible_windows)
 from material import DISPLAY_ORDER, material_snapshot
 
 
@@ -254,11 +254,13 @@ class ChessReviewApp:
         self.overview_counts: dict[str, Counter] = {"white": Counter(), "black": Counter()}
         self.overview_points: list[float] = []
         self.results: queue.Queue[tuple[int, Future]] = queue.Queue()
+        self.progress_results: queue.Queue[tuple[int, chess.engine.Score, float]] = queue.Queue()
         self.stats_events: queue.Queue = queue.Queue()
         self.stats_cancel = threading.Event()
         self.stats_window: tk.Toplevel | None = None
         self.stats_generation = 0
         self.future: Future | None = None
+        self.analysis_cancel: threading.Event | None = None
         self.generation = 0
         self.analysis_cache: dict[tuple[int, bool], dict] = {}
         self.score_cache: dict[int, tuple[chess.engine.Score | None, float]] = {}
@@ -594,8 +596,8 @@ class ChessReviewApp:
                 max_width = max(300, preview.winfo_width() - 4)
                 max_height = max(250, preview.winfo_height() - 4)
                 factor = min(max_width / source.width, max_height / source.height, 1.0)
-                display = source.resize((round(source.width * factor),
-                                         round(source.height * factor)))
+                display = reduce_glare(source.resize((round(source.width * factor),
+                                                      round(source.height * factor))))
                 photo = ImageTk.PhotoImage(display)
                 state.update({"image": source, "photo": photo, "scale": factor,
                               "start": None, "box": None, "rectangle": None})
@@ -1311,8 +1313,7 @@ class ChessReviewApp:
 
     def _reset_analysis_cache(self, *, reset_bar: bool = False) -> None:
         self.generation += 1
-        if self.future is not None:
-            self.future.cancel()
+        self._cancel_current_analysis()
         self.analysis_cache.clear()
         self.score_cache.clear()
         self.best_arrow_cache.clear()
@@ -1322,6 +1323,14 @@ class ChessReviewApp:
                 self.bar_job = None
             self.bar_display_share = self.bar_target_share = 0.5
             self.bar_last_score = None
+
+    def _cancel_current_analysis(self) -> None:
+        if self.analysis_cancel is not None:
+            self.analysis_cancel.set()
+            self.analysis_cancel = None
+        if self.future is not None:
+            self.analysis_engine.interrupt()
+            self.future.cancel()
 
     def _flip(self) -> None:
         self.flipped = not self.flipped
@@ -1531,8 +1540,7 @@ class ChessReviewApp:
             self.manual_save_path = GAMES_DIR / local_filename("van-tu-choi-nhanh", ".pgn")
             self.game_var.set("Nhánh tự chơi")
             self.generation += 1
-            if self.future is not None:
-                self.future.cancel()
+            self._cancel_current_analysis()
             self.analysis_cache = {
                 key: value for key, value in self.analysis_cache.items()
                 if key[0] <= branch_from
@@ -1599,8 +1607,7 @@ class ChessReviewApp:
             self.variation_start_ply = self.ply
         branch_from = self.ply
         self.generation += 1
-        if self.future is not None:
-            self.future.cancel()
+        self._cancel_current_analysis()
         self.analysis_cache = {key: value for key, value in self.analysis_cache.items()
                                if key[0] <= branch_from}
         self.score_cache = {key: value for key, value in self.score_cache.items()
@@ -2023,8 +2030,7 @@ class ChessReviewApp:
     def _request_analysis(self) -> None:
         self.generation += 1
         generation = self.generation
-        if self.future is not None:
-            self.future.cancel()
+        self._cancel_current_analysis()
         try:
             path = resolve_engine(self.engine_var.get())
         except FileNotFoundError:
@@ -2041,18 +2047,32 @@ class ChessReviewApp:
             self._display_analysis(self.analysis_cache[(self.ply, self.full)])
             return
         self.status_var.set("Đang phân tích sâu…" if self.full else "Đang đánh giá nước vừa đi…")
+        cancel = threading.Event()
+        self.analysis_cancel = cancel
         self.future = self.executor.submit(
             self.analysis_engine.run, path, previous, move, current, self.full,
             seconds, self.reviewing and self.review_stage == "step",
+            lambda score, white_ep: self.progress_results.put((generation, score, white_ep)),
+            cancel,
         )
         self.future.add_done_callback(lambda future: self.results.put((generation, future)))
 
     def _poll_results(self) -> None:
         try:
             while True:
+                generation, score, white_ep = self.progress_results.get_nowait()
+                if generation == self.generation:
+                    self.score_cache[self.ply] = (score, white_ep)
+                    self._draw_bar(score, white_ep)
+                    self.status_var.set("Ước lượng nhanh · đang kiểm tra nước đi…")
+        except queue.Empty:
+            pass
+        try:
+            while True:
                 generation, future = self.results.get_nowait()
                 if generation != self.generation or future.cancelled():
                     continue
+                self.analysis_cancel = None
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -2362,8 +2382,7 @@ class ChessReviewApp:
         self.stats_cancel.set()
         self.overview_cancel.set()
         self._stop_autoplay()
-        if self.future is not None:
-            self.future.cancel()
+        self._cancel_current_analysis()
         self.executor.submit(self.analysis_engine.close)
         self.executor.shutdown(wait=False)
         self.stats_executor.shutdown(wait=False, cancel_futures=True)

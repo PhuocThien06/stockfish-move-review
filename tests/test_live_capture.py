@@ -13,7 +13,8 @@ PIECES = Path(__file__).resolve().parents[1] / "pieces"
 
 
 def render(board: chess.Board, flipped: bool = False,
-           highlights: tuple[int, ...] = ()) -> Image.Image:
+           highlights: tuple[int, ...] = (),
+           light: str = "#f0d9b5", dark: str = "#b58863") -> Image.Image:
     image = Image.new("RGB", (512, 512))
     draw = ImageDraw.Draw(image)
     for row in range(8):
@@ -21,7 +22,7 @@ def render(board: chess.Board, flipped: bool = False,
             file_ = 7 - col if flipped else col
             rank = row if flipped else 7 - row
             square = chess.square(file_, rank)
-            color = "#f0d9b5" if (file_ + rank) % 2 else "#b58863"
+            color = light if (file_ + rank) % 2 else dark
             if square in highlights:
                 color = "#cdd26a" if (file_ + rank) % 2 else "#a6ad55"
             left, top = col * 64, row * 64
@@ -118,6 +119,18 @@ class LiveCaptureTests(unittest.TestCase):
         initial.push(second)
         self.assertEqual([first, second], tracker.observe(render(initial)))
         self.assertEqual(initial.fen(), tracker.board.fen())
+
+    def test_reads_bright_board_without_changing_system_hdr(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board, light="#ffffff", dark="#ffdda3"))
+        board.push_san("e4")
+        board.push_san("e5")
+        found = recognize_board(render(board, light="#ffffff", dark="#ffdda3"),
+                                False, board.turn)
+        self.assertEqual(board.board_fen(), found.board_fen())
+        self.assertEqual(list(board.move_stack),
+                         tracker.observe(render(board, light="#ffffff", dark="#ffdda3")))
 
 
 if __name__ == "__main__":

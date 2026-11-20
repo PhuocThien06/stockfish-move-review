@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import struct
 import subprocess
+import threading
 from pathlib import Path
 
 import chess
@@ -316,6 +317,21 @@ class EngineSession:
         self.engine: chess.engine.SimpleEngine | None = None
         self.path: str | None = None
         self.mode: bool | None = None
+        self._lock = threading.Lock()
+        self._cancel: threading.Event | None = None
+        self._active: chess.engine.SimpleAnalysisResult | None = None
+
+    def interrupt(self) -> None:
+        """Stop the running UCI search so the newest position can start."""
+        with self._lock:
+            cancel, active = self._cancel, self._active
+            if cancel is not None:
+                cancel.set()
+        if active is not None:
+            try:
+                active.stop()
+            except (OSError, RuntimeError, chess.engine.EngineError):
+                pass
 
     def close(self) -> None:
         if self.engine is not None:
@@ -340,15 +356,61 @@ class EngineSession:
         self, path: str, before: chess.Board | None, move: chess.Move | None,
         current: chess.Board, full: bool, seconds: float,
         show_best_arrow: bool = False,
+        preview_callback=None,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
-        for attempt in range(2):
+        cancel = cancel_event or threading.Event()
+        with self._lock:
+            self._cancel = cancel
+        try:
+            for attempt in range(2):
+                try:
+                    if cancel.is_set():
+                        raise InterruptedError("Đã chuyển sang vị trí mới.")
+                    self._ensure(path, full)
+                    proxy = _InterruptibleEngine(self, cancel)
+                    if preview_callback is not None and not current.is_game_over():
+                        info = proxy.analyse(current, chess.engine.Limit(time=0.15),
+                                             info=chess.engine.INFO_SCORE)
+                        preview_callback(info["score"].pov(chess.WHITE),
+                                         expected_points(info, chess.WHITE))
+                    return analyze_position(
+                        proxy, before, move, current, full, seconds, show_best_arrow,
+                    )
+                except (chess.engine.EngineTerminatedError, BrokenPipeError, OSError):
+                    self.close()
+                    if attempt:
+                        raise
+            raise RuntimeError("Không mở được Stockfish.")
+        finally:
+            with self._lock:
+                if self._cancel is cancel:
+                    self._cancel = None
+                self._active = None
+
+
+class _InterruptibleEngine:
+    """Synchronous engine adapter that exposes a stoppable active search."""
+
+    def __init__(self, session: EngineSession, cancel: threading.Event) -> None:
+        self.session = session
+        self.cancel = cancel
+
+    def analyse(self, board: chess.Board, limit: chess.engine.Limit, **options):
+        if self.cancel.is_set():
+            raise InterruptedError("Đã chuyển sang vị trí mới.")
+        with self.session.engine.analysis(board, limit, **options) as analysis:
+            with self.session._lock:
+                self.session._active = analysis
+                interrupted = self.cancel.is_set()
+            if interrupted:
+                analysis.stop()
             try:
-                self._ensure(path, full)
-                return analyze_position(
-                    self.engine, before, move, current, full, seconds, show_best_arrow,
-                )
-            except (chess.engine.EngineTerminatedError, BrokenPipeError, OSError):
-                self.close()
-                if attempt:
-                    raise
-        raise RuntimeError("Không mở được Stockfish.")
+                analysis.wait()
+                if self.cancel.is_set():
+                    raise InterruptedError("Đã chuyển sang vị trí mới.")
+                return analysis.multipv if options.get("multipv") is not None else analysis.info
+            finally:
+                with self.session._lock:
+                    if self.session._active is analysis:
+                        self.session._active = None
