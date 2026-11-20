@@ -104,7 +104,7 @@ def explain_move(board: chess.Board, move: chess.Move, assessment: dict, questio
     if assessment["category"] == "book":
         parts.append(f"{san} đưa ván cờ vào một vị trí có trong kho khai cuộc của ứng dụng.")
     elif assessment["category"] == "forced":
-        parts.append(f"Trước {san}, bạn chỉ có một nước hợp lệ. Vì thế nhãn là Bắt buộc.")
+        parts.append(f"Trước {san}, bạn chỉ có một nước hợp lệ. Vì thế nhãn là Forced Move.")
     elif assessment["category"] == "brilliant":
         if offer and offer["net_material_loss"] >= 2:
             piece_name = PIECE_NAMES[offer["piece_type"]]
@@ -125,7 +125,7 @@ def explain_move(board: chess.Board, move: chess.Move, assessment: dict, questio
         else:
             parts.append(
                 "Biến thể này chưa chứng minh được thí quân thật; hãy phân tích sâu hơn "
-                "trước khi tin nhãn Thiên tài."
+                "trước khi tin nhãn Brilliant."
             )
     elif assessment["category"] == "great":
         parts.append(f"{san} giữ được lựa chọn mạnh trong thế cờ này; phương án đứng sau mà máy xét kém hơn rõ rệt.")

@@ -30,6 +30,7 @@ from analysis_core import (
 )
 from chesscom_import import sync_recent_games
 from coach import explain_move
+from grade_badges import draw_badge, make_badge, text_color
 from local_store import load_favorites, prune_old_games, save_favorites
 from material import DISPLAY_ORDER, material_snapshot
 
@@ -421,8 +422,11 @@ class ChessReviewApp:
         self.grade_section = ttk.Frame(self.analysis_panel)
         self.grade_section.pack(fill="x")
         ttk.Label(self.grade_section, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.grade_label = ttk.Label(self.grade_section, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
-        self.grade_label.pack(anchor="w", pady=(5, 0))
+        grade_row = ttk.Frame(self.grade_section)
+        grade_row.pack(anchor="w", pady=(5, 0))
+        self.grade_badge = make_badge(grade_row, None, 48)
+        self.grade_label = ttk.Label(grade_row, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
+        self.grade_label.pack(side="left", padx=(6, 0))
         ttk.Label(self.grade_section, textvariable=self.detail_var).pack(anchor="w")
         ttk.Label(self.grade_section, textvariable=self.bar_orientation_var).pack(anchor="w", pady=(6, 0))
         ttk.Label(self.grade_section, textvariable=self.eval_var).pack(anchor="w")
@@ -471,7 +475,10 @@ class ChessReviewApp:
             ttk.Label(self.overview_grid, text=heading, font=("Segoe UI", 9, "bold"),
                       foreground="#a8d77a").grid(row=0, column=col, sticky="w", padx=(0, 14))
         for row, (code, (name, color)) in enumerate(LABELS.items(), 1):
-            ttk.Label(self.overview_grid, text=name, foreground=color).grid(row=row, column=0, sticky="w")
+            grade_cell = ttk.Frame(self.overview_grid)
+            grade_cell.grid(row=row, column=0, sticky="w")
+            make_badge(grade_cell, code, 27).pack(side="left", padx=(0, 7))
+            ttk.Label(grade_cell, text=name, foreground=text_color(code)).pack(side="left")
             for col, side in ((1, "white"), (2, "black")):
                 variable = tk.StringVar(value="0")
                 self.overview_count_vars[(side, code)] = variable
@@ -905,6 +912,7 @@ class ChessReviewApp:
                         self.overview_intro.set(f"Phân tích tổng quan dừng: {exc}. Vẫn có thể xem lại từng nước.")
                     else:
                         self.overview_intro.set(f"Đã phân tích {len(self.moves)} nước. Bấm Xem lại từng nước để khám phá.")
+                    self._fill_moves()
                     self.overview_start_button.configure(state="normal")
         except queue.Empty:
             pass
@@ -931,10 +939,17 @@ class ChessReviewApp:
         for index, move in enumerate(self.moves):
             board = self.positions[index]
             prefix = f"{board.fullmove_number}{'.' if board.turn else '...'}"
-            self.move_list.insert("end", f"{prefix} {board.san(move)}")
+            category = self.overview_assessments.get(index + 1, {}).get("category")
+            label = f"  ·  {LABELS[category][0]}" if category in LABELS else ""
+            self.move_list.insert("end", f"{prefix} {board.san(move)}{label}")
+            if category in LABELS:
+                self.move_list.itemconfigure(index, foreground=text_color(category))
             if self.original_review_state is not None and self.variation_start_ply is not None:
                 if index >= self.variation_start_ply:
                     self.move_list.itemconfigure(index, foreground="#f2c66e")
+        if self.review_stage == "step" and self.ply:
+            self.move_list.selection_set(self.ply - 1)
+            self.move_list.see(self.ply - 1)
 
     def _select_move(self, _event: tk.Event) -> None:
         selection = self.move_list.curselection()
@@ -1523,11 +1538,13 @@ class ChessReviewApp:
         elif overview:
             code = overview["category"]
             self.grade_var.set(LABELS[code][0])
-            self.grade_label.configure(foreground=LABELS[code][1])
+            self.grade_label.configure(foreground=text_color(code))
+            self._set_grade_badge(code)
             self.detail_var.set(f"Mất {overview['ep_loss'] * 100:.1f}% điểm kỳ vọng")
             self._set_coach_mood(code)
         else:
             self.grade_var.set("Đang phân tích…" if self.ply else "Vị trí ban đầu")
+            self._set_grade_badge(None)
             self.detail_var.set("")
             self._set_coach_mood("")
         self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
@@ -1686,6 +1703,7 @@ class ChessReviewApp:
                     result = future.result()
                 except Exception as exc:
                     self.grade_var.set("Không phân tích được")
+                    self._set_grade_badge(None)
                     self.detail_var.set("Hãy kiểm tra tệp Stockfish và thử lại.")
                     self.status_var.set(f"Stockfish gặp lỗi: {exc}")
                     continue
@@ -1695,6 +1713,13 @@ class ChessReviewApp:
         except queue.Empty:
             pass
         self.root.after(100, self._poll_results)
+
+    def _set_grade_badge(self, category: str | None) -> None:
+        draw_badge(self.grade_badge, category, 48)
+        if category in LABELS:
+            self.grade_badge.pack(side="left", before=self.grade_label)
+        else:
+            self.grade_badge.pack_forget()
 
     def _display_analysis(self, result: dict) -> None:
         if self.reviewing and self.review_stage == "step":
@@ -1707,7 +1732,8 @@ class ChessReviewApp:
         category = result["category"]
         name, color = LABELS.get(category, ("Vị trí ban đầu", "#ede9e1"))
         self.grade_var.set(name)
-        self.grade_label.configure(foreground=color)
+        self.grade_label.configure(foreground=text_color(category) if category in LABELS else color)
+        self._set_grade_badge(category)
         self._set_coach_mood(category)
         self.detail_var.set(result["detail"])
         self._draw_bar(result["score"], result["white_ep"])

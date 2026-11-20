@@ -13,17 +13,17 @@ import chess.polyglot
 
 
 LABELS = {
-    "brilliant": ("!! Thiên tài", "#1eb7bd"),
-    "great": ("! Rất mạnh", "#3b8edb"),
-    "best": ("★ Tốt nhất", "#58ad51"),
-    "excellent": ("✓ Xuất sắc", "#80ba4c"),
-    "good": ("✓ Tốt", "#99bb74"),
-    "book": ("▤ Theo lý thuyết", "#ab7442"),
-    "forced": ("→ Bắt buộc", "#8797a0"),
-    "inaccuracy": ("?! Kém chính xác", "#e6b32e"),
-    "mistake": ("? Sai lầm", "#e48b39"),
-    "miss": ("× Bỏ lỡ cơ hội", "#e45b4c"),
-    "blunder": ("?? Sai lầm nghiêm trọng", "#d33b3b"),
+    "brilliant": ("Brilliant", "#13aeb1"),
+    "great": ("Great Move", "#147bca"),
+    "best": ("Best Move", "#2b9c42"),
+    "excellent": ("Excellent", "#80b927"),
+    "good": ("Good", "#94bc65"),
+    "book": ("Book Move", "#95612e"),
+    "forced": ("Forced Move", "#47657a"),
+    "inaccuracy": ("Inaccuracy", "#f4b710"),
+    "mistake": ("Mistake", "#f28c16"),
+    "miss": ("Miss", "#e74838"),
+    "blunder": ("Blunder", "#c72027"),
 }
 
 
