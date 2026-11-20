@@ -249,6 +249,7 @@ class ChessReviewApp:
         self.games: list[chess.pgn.Game] = []
         self.current_game: chess.pgn.Game | None = None
         self.manual_save_path: Path | None = None
+        self.manual_branch_source: Path | None = None
         self.moves: list[chess.Move] = []
         self.positions: list[chess.Board] = [chess.Board()]
         self.ply = 0
@@ -711,6 +712,7 @@ class ChessReviewApp:
         self.variation_start_ply = None
         self._update_favorite_button()
         self.manual_save_path = None
+        self.manual_branch_source = None
         self._stop_autoplay()
         self._reset_analysis_cache()
         self._clear_annotations()
@@ -751,6 +753,7 @@ class ChessReviewApp:
         self.variation_start_ply = None
         self._update_favorite_button()
         self.manual_save_path = None
+        self.manual_branch_source = None
         self.moves = []
         self.positions = [chess.Board()]
         self.ply = 0
@@ -896,14 +899,12 @@ class ChessReviewApp:
                     self.move_list.itemconfigure(index, foreground="#f2c66e")
 
     def _select_move(self, _event: tk.Event) -> None:
-        if not self.reviewing:
-            return
         selection = self.move_list.curselection()
         if selection and self.ply != selection[0] + 1:
             self._go_to(selection[0] + 1)
 
     def _go_to(self, ply: int, *, from_autoplay: bool = False) -> None:
-        if not self.reviewing or self.review_stage != "step":
+        if self.reviewing and self.review_stage != "step":
             return
         if not from_autoplay:
             self._stop_autoplay()
@@ -1146,7 +1147,31 @@ class ChessReviewApp:
             if self.review_stage == "step":
                 self._play_variation_move(move)
             return
-        board = self.positions[-1].copy(stack=True)
+        current = self.positions[self.ply]
+        if move not in current.legal_moves:
+            return
+        if self.ply < len(self.moves) and self.moves[self.ply] == move:
+            self._go_to(self.ply + 1)
+            return
+        if self.ply < len(self.moves):
+            branch_from = self.ply
+            self.manual_branch_source = self.manual_save_path
+            self.manual_save_path = GAMES_DIR / local_filename("van-tu-choi-nhanh", ".pgn")
+            self.game_var.set("Nhánh tự chơi")
+            self.generation += 1
+            if self.future is not None:
+                self.future.cancel()
+            self.analysis_cache = {
+                key: value for key, value in self.analysis_cache.items()
+                if key[0] <= branch_from
+            }
+            self.score_cache = {
+                key: value for key, value in self.score_cache.items()
+                if key <= branch_from
+            }
+            self.moves = self.moves[:branch_from]
+            self.positions = self.positions[:branch_from + 1]
+        board = current.copy(stack=True)
         self.moves.append(move)
         board.push(move)
         self.positions.append(board)
@@ -1160,6 +1185,9 @@ class ChessReviewApp:
             saved_game = chess.pgn.Game.from_board(board)
             saved_game.headers["White"] = "Trắng"
             saved_game.headers["Black"] = "Đen"
+            if self.manual_branch_source is not None:
+                saved_game.headers["Event"] = "Nhánh tự chơi"
+                saved_game.headers["SourcePGN"] = self.manual_branch_source.name
             self.manual_save_path.write_text(str(saved_game) + "\n", encoding="utf-8")
             self.current_game_path = self.manual_save_path
             self._update_favorite_button()
@@ -1168,6 +1196,8 @@ class ChessReviewApp:
         if board.is_game_over():
             self.review_button.configure(state="normal")
             self.status_var.set("Ván đã kết thúc. Bấm Xem lại để bật phân tích sâu.")
+        else:
+            self.review_button.configure(state="disabled")
         self._refresh()
 
     def _play_variation_move(self, move: chess.Move) -> None:

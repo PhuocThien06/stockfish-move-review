@@ -26,7 +26,7 @@ Tên đồng bộ mặc định là **TheFallenWizard**. Khi mở ứng dụng, 
 
 ## Sử dụng
 
-- **Bàn cờ tự đi:** bấm quân rồi bấm ô đích, hoặc giữ chuột trái kéo quân và thả. Bạn đi cả Trắng lẫn Đen. Stockfish chỉ đánh giá nước vừa đi và cập nhật thanh lợi thế; không gợi ý nước tiếp theo trong chế độ này.
+- **Bàn cờ tự đi:** bấm quân rồi bấm ô đích, hoặc giữ chuột trái kéo quân và thả. Bạn đi cả Trắng lẫn Đen. Stockfish chỉ đánh giá nước vừa đi và cập nhật thanh lợi thế; không gợi ý nước tiếp theo trong chế độ này. Có thể dùng nút đầu/trước/sau/cuối, phím `Home`, `←`, `→`, `End` hoặc danh sách nước để quay lại khi đang tự đi. Nếu đi trùng nước cũ, ứng dụng tiến tới nước đó; nếu đổi nước, ứng dụng lưu đường mới thành PGN riêng và giữ PGN cũ trong **Ván đã lưu**.
 - **Đánh dấu:** bấm chuột phải lên ô để tô đỏ; giữ chuột phải kéo giữa hai ô để vẽ mũi tên vàng. Có thể vẽ nhiều mũi tên. Bấm lại bằng chuột phải hoặc bấm trái vào ô/mũi tên để xóa.
 - **Quân đã ăn và chênh lệch vật chất:** dải trên/dưới bàn cờ hiện quân đối phương mỗi bên đã ăn, số quân đã ăn và điểm hơn `+N` của bên đang dẫn. Điểm quy đổi: tốt 1, mã 3, tượng 3, xe 5, hậu 9. Chỉ số lấy từ vị trí đang hiển thị, nên tua ván, lật bàn hoặc đi nhánh khác sẽ cập nhật ngay; phong cấp cũng được tính vào chênh lệch.
 - **PGN riêng:** bấm **Mở PGN…** hoặc **Dán PGN…**. Bản sao được lưu trên ổ D.
