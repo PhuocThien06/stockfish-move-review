@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import chess
 
-from analysis_core import LABELS, variation_text
+from analysis_core import LABELS, material_offer, variation_text
 
 
 PIECE_NAMES = {
@@ -45,6 +45,44 @@ def _observations(board: chess.Board, move: chess.Move) -> list[str]:
     return facts
 
 
+def _piece_pressure(board: chess.Board, move: chess.Move,
+                    played_pv: list[chess.Move]) -> list[str]:
+    """Name newly attacked pieces and show whether the next PV move moves one."""
+    piece = board.piece_at(move.from_square)
+    if piece is None:
+        return []
+    before_attacks = board.attacks(move.from_square)
+    after = board.copy(stack=False)
+    after.push(move)
+    if after.piece_at(move.to_square) is None:
+        return []
+    targets = [
+        (square, target) for square, target in after.piece_map().items()
+        if target.color != piece.color and target.piece_type in (
+            chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
+        ) and square in after.attacks(move.to_square) and square not in before_attacks
+    ]
+    targets.sort(key=lambda item: {chess.QUEEN: 9, chess.ROOK: 5,
+                                   chess.BISHOP: 3, chess.KNIGHT: 3}[item[1].piece_type],
+                 reverse=True)
+    if not targets:
+        return []
+    square, target = targets[0]
+    target_name = PIECE_NAMES[target.piece_type]
+    details = [
+        f"{PIECE_NAMES[piece.piece_type].capitalize()} trên {chess.square_name(move.to_square)} "
+        f"vừa tạo sức ép trực tiếp lên {target_name} đối phương ở {chess.square_name(square)}."
+    ]
+    if len(played_pv) > 1 and played_pv[1] in after.legal_moves:
+        reply = played_pv[1]
+        if reply.from_square == square:
+            details.append(
+                f"Trong biến thể Stockfish, đối phương đáp {after.san(reply)}; "
+                f"{target_name} rời ô {chess.square_name(square)}."
+            )
+    return details
+
+
 def explain_move(board: chess.Board, move: chess.Move, assessment: dict, question: str = "") -> str:
     """Explain only verifiable board facts and engine lines; avoid invented plans."""
     san = board.san(move)
@@ -54,58 +92,90 @@ def explain_move(board: chess.Board, move: chess.Move, assessment: dict, questio
     played_ep = assessment["played_ep"]
     best_line = variation_text(board, assessment["best_pv"], 8)
     played_line = variation_text(board, assessment["played_pv"], 8)
-    question = question.strip()
-    question_lower = question.casefold()
-    introduction = f"Bạn hỏi: {question}\n\n" if question else ""
-    parts = [introduction + f"Bruno · {san} được xếp loại {label}."]
-    parts.append(
-        f"Vì sao? Stockfish so sánh các nước hợp lệ từ cùng một thế cờ. "
-        f"Điểm kỳ vọng của phương án tốt nhất là {best_ep * 100:.1f}%, "
-        f"còn nước {san} là {played_ep * 100:.1f}%. "
-        f"Chênh lệch là {loss * 100:.1f} điểm phần trăm. "
-        "Đây là thước đo từ xác suất thắng/hòa/thua của Stockfish, không phải tỷ lệ thắng chắc chắn của bạn."
+    offer = assessment.get("material_offer") or material_offer(
+        board, move, assessment["played_pv"]
     )
+    question_lower = question.strip().casefold()
+    parts = [f"Bruno · {san} — {label}."]
+    facts = _observations(board, move)
+    if facts:
+        parts.append("Trên bàn: " + " ".join(facts))
+    parts.extend(_piece_pressure(board, move, assessment["played_pv"]))
     if assessment["category"] == "book":
-        parts.append("Nước đi nằm trong cơ sở dữ liệu khai cuộc và không làm giảm đáng kể điểm kỳ vọng.")
+        parts.append(f"{san} đưa ván cờ vào một vị trí có trong kho khai cuộc của ứng dụng.")
     elif assessment["category"] == "forced":
-        parts.append("Trước khi đi, chỉ có đúng một nước hợp lệ nên nước này được xếp là bắt buộc.")
+        parts.append(f"Trước {san}, bạn chỉ có một nước hợp lệ. Vì thế nhãn là Bắt buộc.")
     elif assessment["category"] == "brilliant":
-        parts.append("Đây là một nước hy sinh quân rõ ràng trong biến thể máy tính, nhưng vẫn giữ được thế cờ tốt. Nhãn này là ước lượng của ứng dụng.")
+        if offer and offer["net_material_loss"] >= 2:
+            piece_name = PIECE_NAMES[offer["piece_type"]]
+            parts.append(
+                f"Đối phương có thể chơi {offer['reply_san']} để bắt {piece_name}. "
+                f"Sau khi bạn đáp {offer['followup_san']}, bạn vẫn kém "
+                f"{offer['net_material_loss']} điểm vật chất so với trước nước đi. "
+                "Đây là thí quân thật, không phải đổi ngang giá."
+            )
+            if offer["followup_check"]:
+                parts.append(
+                    f"Điểm bù đắp thấy ngay trong biến thể: {offer['followup_san']} "
+                    "chiếu vua, buộc đối phương xử lý đòn chiếu."
+                )
+            elif offer["followup_capture_type"]:
+                captured = PIECE_NAMES[offer["followup_capture_type"]]
+                parts.append(f"Điểm bù đắp thấy ngay: {offer['followup_san']} bắt {captured}.")
+        else:
+            parts.append(
+                "Biến thể này chưa chứng minh được thí quân thật; hãy phân tích sâu hơn "
+                "trước khi tin nhãn Thiên tài."
+            )
     elif assessment["category"] == "great":
-        parts.append("Nước này nổi bật vì phương án đứng thứ hai kém hơn rõ rệt theo Stockfish. Nhãn này là ước lượng của ứng dụng.")
+        parts.append(f"{san} giữ được lựa chọn mạnh trong thế cờ này; phương án đứng sau mà máy xét kém hơn rõ rệt.")
     elif assessment["category"] == "miss":
-        parts.append("Trước nước đi có cơ hội lớn; sau nước đi lợi thế giảm mạnh. So sánh hai biến thể dưới đây để thấy cơ hội đã bỏ lỡ.")
-    elif assessment["category"] in ("inaccuracy", "mistake", "blunder"):
-        parts.append("Nước đi làm giảm đáng kể điểm kỳ vọng. Hãy xem nước thay thế và câu trả lời dự kiến của đối phương; nguyên nhân cụ thể nằm trong biến thể, không thể suy ra chỉ từ con số.")
+        parts.append(f"Máy tìm thấy cơ hội lớn hơn với {assessment['best_prior']}; {san} bỏ qua cơ hội đó.")
+    if offer and offer["net_material_loss"] <= 0:
+        piece_name = PIECE_NAMES[offer["piece_type"]]
+        captured_type = offer["followup_capture_type"]
+        if captured_type == offer["piece_type"]:
+            parts.append(
+                f"Nếu đối phương chơi {offer['reply_san']} để bắt {piece_name}, "
+                f"{offer['followup_san']} bắt lại {piece_name} của họ. "
+                f"Đây là đổi {piece_name} ngang giá, không phải thí {piece_name}."
+            )
+        else:
+            parts.append(
+                f"Nếu đối phương nhận {piece_name} bằng {offer['reply_san']}, "
+                f"bạn đáp {offer['followup_san']} và không kém vật chất sau chuỗi đó."
+            )
+    best_prior = assessment["best_prior"]
+    if best_prior and best_prior != san:
+        gap = (
+            "gần như ngang nhau trong lần phân tích này"
+            if loss < 0.001 else f"chênh {loss * 100:.1f} điểm phần trăm"
+        )
+        parts.append(
+            f"Máy ưu tiên {best_prior}; {san} giữ khoảng {played_ep * 100:.1f}% "
+            f"điểm kỳ vọng, so với {best_ep * 100:.1f}% của phương án đầu. "
+            f"Hai cách đi {gap}."
+        )
     else:
-        parts.append("Nước đi giữ phần lớn giá trị của vị trí. Nhãn phụ thuộc vào độ sâu và thời gian Stockfish được chạy.")
-    parts.append("Trên bàn cờ: " + " ".join(_observations(board, move)))
+        parts.append(
+            f"{san} là phương án máy ưu tiên trong lần phân tích này "
+            f"(khoảng {played_ep * 100:.1f}% điểm kỳ vọng)."
+        )
+    if played_ep < 0.30 and assessment["category"] in (
+        "brilliant", "great", "best", "excellent", "good"
+    ):
+        parts.append(
+            f"Thế cờ trước đó đã khó cho bạn: {best_ep * 100:.1f}% là mức "
+            "của phương án mạnh nhất. Nhãn tốt ở đây chỉ nói nước này không làm "
+            "giảm thêm nhiều cơ hội, không có nghĩa bạn đang hơn thế."
+        )
     if best_line:
-        parts.append(f"Nếu đi phương án mạnh nhất: {best_line}")
+        parts.append(f"Thử phương án máy chọn: {best_line}")
     if played_line:
-        parts.append(f"Sau nước bạn đã đi, máy dự kiến: {played_line}")
-    if assessment["best_prior"] and assessment["best_prior"] != san:
-        parts.append(f"Nước máy ưu tiên tại thời điểm đó: {assessment['best_prior']}.")
+        parts.append(f"Nếu giữ nước {san}: {played_line}")
     if any(word in question_lower for word in ("thay", "khác", "tốt nhất", "nên đi")):
         parts.append(
-            f"Để thử nước thay thế, quay lại thế cờ trước {san} và đi {assessment['best_prior'] or 'nước đầu tiên trong biến thể mạnh nhất'}. "
-            "Sau đó so sánh câu trả lời của đối phương và thanh đánh giá. "
-            "Một biến thể chỉ là dự báo trong điều kiện chơi chính xác, không phải nước bắt buộc."
+            f"Để so sánh trực tiếp, bấm ‘Đi nước mạnh nhất trên bàn’ và thử "
+            f"{best_prior or 'nước máy chọn'} từ vị trí trước {san}."
         )
-    elif any(word in question_lower for word in ("chiến thuật", "bắt quân", "hy sinh", "chiếu")):
-        parts.append(
-            "Khi kiểm tra chiến thuật, hãy nhìn trước tiên vào nước chiếu, nước bắt quân và đòn đe dọa sau nước đầu tiên "
-            "của mỗi biến thể. Những dữ kiện trên bàn được liệt kê ở đoạn 'Trên bàn cờ'; "
-            "mình không gán tên chiến thuật nếu chưa thể chứng minh bằng chuỗi nước đi."
-        )
-    elif "khai cuộc" in question_lower:
-        parts.append(
-            "Trong khai cuộc, hãy kiểm tra việc phát triển mã/tượng, tranh trung tâm và an toàn vua. "
-            "Nếu đây là nước lý thuyết, nhãn 'Theo lý thuyết' chỉ nói rằng vị trí có trong cơ sở dữ liệu khai cuộc."
-        )
-    parts.append(
-        "Cách đọc biến thể: mỗi nước sau dấu đầu tiên là câu trả lời mạnh dự kiến khi cả hai bên đều chơi chính xác. "
-        "Bạn có thể quay về vị trí trước nước này và thử các nước trên bàn để tự kiểm chứng. "
-        "Nếu muốn, hãy hỏi tiếp về khai cuộc, chiến thuật, hoặc nước thay thế; phần mềm sẽ giải thích bằng dữ kiện đang có."
-    )
     return "\n\n".join(parts)

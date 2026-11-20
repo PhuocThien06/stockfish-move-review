@@ -38,6 +38,12 @@ PIECES = {
     "K": "♔", "Q": "♕", "R": "♖", "B": "♗", "N": "♘", "P": "♙",
     "k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟",
 }
+COACH_MOODS = {
+    "brilliant": "celebrating", "great": "celebrating",
+    "best": "celebrating", "excellent": "celebrating",
+    "inaccuracy": "thinking", "miss": "angry",
+    "mistake": "angry", "blunder": "angry",
+}
 APP_HOME = Path("D:/Chess")
 GAMES_DIR = APP_HOME / "data" / "games"
 REPORTS_DIR = APP_HOME / "data" / "reports"
@@ -204,6 +210,24 @@ class ChessReviewApp:
             for (color, piece), image in self.piece_images.items()
             if piece in "PNBRQ"
         }
+        self.coach_images: dict[str, dict[str, tk.PhotoImage]] = {}
+        for mood, filename in (
+            ("neutral", "bruno_coach.png"),
+            ("celebrating", "bruno_celebrating.png"),
+            ("thinking", "bruno_thinking.png"),
+            ("angry", "bruno_angry.png"),
+        ):
+            asset = piece_folder / filename
+            if asset.is_file():
+                source = tk.PhotoImage(file=str(asset))
+                self.coach_images[mood] = {
+                    "tip": source.subsample(24, 24),
+                    "overview": source.subsample(16, 16),
+                    "popup": source.subsample(9, 9),
+                }
+        self.coach_mood = "neutral"
+        self.coach_panel: ttk.Frame | None = None
+        self.coach_close = None
         self.material_state: dict = {}
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.analysis_engine = EngineSession()
@@ -257,7 +281,7 @@ class ChessReviewApp:
         self.engine_var = tk.StringVar(value=str(APP_HOME / "engine" / "stockfish.exe"))
         self.username_var = tk.StringVar(value="TheFallenWizard")
         self.seconds_var = tk.StringVar(value="3")
-        self.status_var = tk.StringVar(value="Tự đi cả hai bên hoặc dán PGN; dữ liệu lưu trong D:\\Chess\\data.")
+        self.status_var = tk.StringVar(value="")
         self.grade_var = tk.StringVar(value="Chưa có nước đi")
         self.detail_var = tk.StringVar(value="")
         self.eval_var = tk.StringVar(value="0.00")
@@ -308,8 +332,6 @@ class ChessReviewApp:
         heading.pack(fill="x")
         ttk.Label(heading, text="STOCKFISH REVIEW", font=("Segoe UI", 18, "bold"),
                   foreground="#a8d77a").pack(side="left")
-        ttk.Label(heading, text="Tự đi cả hai bên · chỉ bật gợi ý khi xem lại",
-                  foreground="#aaa49a").pack(side="left", padx=16)
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
         ttk.Label(top, text="Stockfish:").pack(side="left")
@@ -363,10 +385,8 @@ class ChessReviewApp:
         self.analysis_panel.pack(fill="both", expand=True)
         self.coach_tip_var = tk.StringVar(value="Bruno: Hãy chọn một nước, mình sẽ giúp bạn đọc vị trí.")
         self.coach_tip_row = ttk.Frame(self.analysis_panel)
-        tip_asset = Path(__file__).resolve().parent / "pieces" / "bruno_coach.png"
-        self.coach_image_tip = tk.PhotoImage(file=str(tip_asset)).subsample(24, 24) if tip_asset.is_file() else None
-        if self.coach_image_tip:
-            ttk.Label(self.coach_tip_row, image=self.coach_image_tip).pack(side="left", padx=(0, 8))
+        self.coach_tip_label = ttk.Label(self.coach_tip_row)
+        self.coach_tip_label.pack(side="left", padx=(0, 8))
         ttk.Label(self.coach_tip_row, textvariable=self.coach_tip_var, wraplength=410,
                   font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
         controls = ttk.Frame(self.analysis_panel)
@@ -398,14 +418,17 @@ class ChessReviewApp:
 
         self.analysis_separator = ttk.Separator(self.analysis_panel)
         self.analysis_separator.pack(fill="x", pady=12)
-        ttk.Label(self.analysis_panel, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.grade_label = ttk.Label(self.analysis_panel, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
+        self.grade_section = ttk.Frame(self.analysis_panel)
+        self.grade_section.pack(fill="x")
+        ttk.Label(self.grade_section, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self.grade_label = ttk.Label(self.grade_section, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
         self.grade_label.pack(anchor="w", pady=(5, 0))
-        ttk.Label(self.analysis_panel, textvariable=self.detail_var).pack(anchor="w")
-        ttk.Label(self.analysis_panel, textvariable=self.bar_orientation_var).pack(anchor="w", pady=(6, 0))
-        ttk.Label(self.analysis_panel, textvariable=self.eval_var).pack(anchor="w")
+        ttk.Label(self.grade_section, textvariable=self.detail_var).pack(anchor="w")
+        ttk.Label(self.grade_section, textvariable=self.bar_orientation_var).pack(anchor="w", pady=(6, 0))
+        ttk.Label(self.grade_section, textvariable=self.eval_var).pack(anchor="w")
 
         full_row = ttk.Frame(self.analysis_panel)
+        self.full_row = full_row
         full_row.pack(fill="x", pady=(14, 5))
         self.full_button = ttk.Button(full_row, text="Bật Full công suất", command=self._toggle_full,
                                       state="disabled", style="Accent.TButton")
@@ -434,13 +457,11 @@ class ChessReviewApp:
         ttk.Label(self.overview_panel, textvariable=self.overview_intro, wraplength=480).pack(anchor="w", pady=(3, 3))
         coach_row = ttk.Frame(self.overview_panel)
         coach_row.pack(fill="x", pady=(0, 3))
-        coach_asset = Path(__file__).resolve().parent / "pieces" / "bruno_coach.png"
-        self.coach_image = tk.PhotoImage(file=str(coach_asset)).subsample(16, 16) if coach_asset.is_file() else None
-        self.coach_image_popup = tk.PhotoImage(file=str(coach_asset)).subsample(9, 9) if coach_asset.is_file() else None
-        if self.coach_image:
-            ttk.Label(coach_row, image=self.coach_image).pack(side="left", padx=(0, 10))
+        self.coach_overview_label = ttk.Label(coach_row)
+        self.coach_overview_label.pack(side="left", padx=(0, 10))
         ttk.Label(coach_row, text="Bruno · HLV cờ của bạn\nMình sẽ cùng bạn xem các thời điểm quan trọng và giải thích từng nước bằng biến thể cụ thể.",
                   wraplength=330, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        self._set_coach_mood("")
         ttk.Label(self.overview_panel, text="PHÂN LOẠI NƯỚC ĐI", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(2, 2))
         self.overview_grid = ttk.Frame(self.overview_panel)
         self.overview_grid.pack(fill="x")
@@ -710,6 +731,7 @@ class ChessReviewApp:
         listing.bind("<Double-Button-1>", lambda _event: choose())
 
     def _load_game(self, game: chess.pgn.Game) -> None:
+        self._dismiss_coach_panel()
         self.current_game = game
         self.original_review_state = None
         self.variation_save_path = None
@@ -721,6 +743,10 @@ class ChessReviewApp:
         self._reset_analysis_cache()
         self._clear_annotations()
         self.moves = list(game.mainline_moves())
+        player = self.username_var.get().strip().casefold()
+        white = game.headers.get("White", "").strip().casefold()
+        black = game.headers.get("Black", "").strip().casefold()
+        self.flipped = bool(player and black == player and white != player)
         board = game.board()
         self.positions = [board.copy(stack=True)]
         for move in self.moves:
@@ -744,6 +770,7 @@ class ChessReviewApp:
         self._show_overview(game)
 
     def _new_game(self) -> None:
+        self._dismiss_coach_panel()
         self.user_acted = True
         self._stop_autoplay()
         self._reset_analysis_cache()
@@ -761,6 +788,7 @@ class ChessReviewApp:
         self.moves = []
         self.positions = [chess.Board()]
         self.ply = 0
+        self.flipped = False
         self.reviewing = False
         self.review_stage = "manual"
         self.full = False
@@ -784,6 +812,7 @@ class ChessReviewApp:
     def _review_manual(self) -> None:
         if not self.positions[-1].is_game_over():
             return
+        self._dismiss_coach_panel()
         game = chess.pgn.Game.from_board(self.positions[-1])
         game.headers["White"] = "Trắng"
         game.headers["Black"] = "Đen"
@@ -806,6 +835,7 @@ class ChessReviewApp:
         self._show_overview(game)
 
     def _show_overview(self, game: chess.pgn.Game) -> None:
+        self._dismiss_coach_panel()
         self.overview_cancel.set()
         self.overview_cancel = threading.Event()
         self.overview_generation += 1
@@ -1289,6 +1319,7 @@ class ChessReviewApp:
         self._refresh()
 
     def _return_to_original(self) -> None:
+        self._dismiss_coach_panel()
         original = self.original_review_state
         if original is None:
             return
@@ -1325,11 +1356,12 @@ class ChessReviewApp:
         if self.full:
             self.coach_tip_row.pack_forget()
             self.move_list.configure(height=5)
-            self.full_frame.pack(fill="both", expand=True, pady=(0, 5), before=self.status_label)
+            if self.coach_panel is None:
+                self.full_frame.pack(fill="both", expand=True, pady=(0, 5), before=self.status_label)
         else:
             self.full_frame.pack_forget()
             self.move_list.configure(height=7)
-            if self.review_stage == "step":
+            if self.review_stage == "step" and self.coach_panel is None:
                 self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
         self._request_analysis()
 
@@ -1439,6 +1471,29 @@ class ChessReviewApp:
             pass
         self.root.after(100, self._poll_stats)
 
+    def _set_coach_mood(self, category: str) -> None:
+        mood = COACH_MOODS.get(category, "neutral")
+        self.coach_mood = mood
+        images = self.coach_images.get(mood) or self.coach_images.get("neutral", {})
+        if images:
+            self.coach_tip_label.configure(image=images["tip"])
+        neutral = self.coach_images.get("neutral")
+        if neutral:
+            self.coach_overview_label.configure(image=neutral["overview"])
+        if self.review_stage == "step" and self.ply and category in (
+            "brilliant", "great", "inaccuracy", "miss", "mistake", "blunder"
+        ):
+            san = self.positions[self.ply - 1].san(self.moves[self.ply - 1])
+            reactions = {
+                "brilliant": "Tuyệt vời! Hỏi mình để xem nước thí quân tạo ra điều gì.",
+                "great": "Hay lắm! Cùng xem vì sao nước này quan trọng.",
+                "inaccuracy": "Khoan đã, có thể còn cách chính xác hơn.",
+                "miss": "Ôi, bạn vừa bỏ qua một cơ hội lớn. Cùng xem lại.",
+                "mistake": "Nước này làm thế cờ xấu đi. Mình sẽ chỉ ra chỗ khó.",
+                "blunder": "Ôi không! Nước này tổn thất nặng. Cùng tìm nguyên nhân.",
+            }
+            self.coach_tip_var.set(f"Bruno: {san} — {reactions[category]}")
+
     def _refresh(self) -> None:
         self.selected_square = None
         self._render_board()
@@ -1470,9 +1525,11 @@ class ChessReviewApp:
             self.grade_var.set(LABELS[code][0])
             self.grade_label.configure(foreground=LABELS[code][1])
             self.detail_var.set(f"Mất {overview['ep_loss'] * 100:.1f}% điểm kỳ vọng")
+            self._set_coach_mood(code)
         else:
             self.grade_var.set("Đang phân tích…" if self.ply else "Vị trí ban đầu")
             self.detail_var.set("")
+            self._set_coach_mood("")
         self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
         self._request_analysis()
 
@@ -1590,7 +1647,7 @@ class ChessReviewApp:
                                   fill=top_color, outline="")
         self.bar.create_rectangle(0, BOARD_SIZE - bottom_height, 40, BOARD_SIZE,
                                   fill=bottom_color, outline="")
-        self.eval_var.set(score_text(score) if score else "0.00")
+        self.eval_var.set(score_text(-score if self.flipped else score) if score else "0.00")
 
     def _request_analysis(self) -> None:
         self.generation += 1
@@ -1651,6 +1708,7 @@ class ChessReviewApp:
         name, color = LABELS.get(category, ("Vị trí ban đầu", "#ede9e1"))
         self.grade_var.set(name)
         self.grade_label.configure(foreground=color)
+        self._set_coach_mood(category)
         self.detail_var.set(result["detail"])
         self._draw_bar(result["score"], result["white_ep"])
         if self.full:
@@ -1667,37 +1725,59 @@ class ChessReviewApp:
             self.full_text.delete("1.0", "end")
             self.full_text.insert("1.0", "\n".join(notes))
             self.full_text.configure(state="disabled")
-        self.status_var.set("Đã phân tích. Nhãn đánh giá là ước lượng, có thể khác Chess.com.")
+        self.status_var.set("")
+
+    def _dismiss_coach_panel(self) -> None:
+        if self.coach_close is not None:
+            close = self.coach_close
+            self.coach_close = None
+            close()
 
     def _ask_coach(self) -> None:
         if self.review_stage != "step" or self.ply == 0:
             self.status_var.set("Chọn một nước trong danh sách rồi hỏi HLV Bruno.")
             return
-        popup = tk.Toplevel(self.root)
-        popup.title("Hỏi HLV Bruno · giải thích nước đi")
-        popup.configure(bg="#211f1c")
-        popup.geometry(
-            f"560x610+{self.root.winfo_rootx() + BOARD_SIZE + 60}"
-            f"+{self.root.winfo_rooty() + 35}"
-        )
-        header = ttk.Frame(popup, padding=12)
+        self._dismiss_coach_panel()
+        self._stop_autoplay()
+        self.coach_tip_row.pack_forget()
+        self.move_list.pack_forget()
+        self.analysis_separator.pack_forget()
+        self.grade_section.pack_forget()
+        self.full_frame.pack_forget()
+        panel = ttk.LabelFrame(self.analysis_panel, text="Bruno · HLV cờ", padding=8)
+        panel.pack(fill="both", expand=True, before=self.status_label)
+        self.coach_panel = panel
+        header = ttk.Frame(panel)
         header.pack(fill="x")
-        if self.coach_image_popup:
-            ttk.Label(header, image=self.coach_image_popup).pack(side="left", padx=(0, 12))
-        ttk.Label(header, text="Bruno · HLV cờ\nHỏi về nước vừa chọn. Mình sẽ đối chiếu các biến thể Stockfish và vị trí thật trên bàn.",
-                  wraplength=350, font=("Segoe UI", 11)).pack(side="left", fill="x", expand=True)
+        popup_image_label = ttk.Label(header)
+        popup_image_label.pack(side="left", padx=(0, 10))
+        current_images = self.coach_images.get(self.coach_mood)
+        if current_images:
+            popup_image_label.configure(image=current_images["popup"])
+        ttk.Label(header, text="Hỏi về nước vừa chọn. Mình sẽ đi từng nước trong biến thể để bạn thấy điều gì xảy ra trên bàn.",
+                  wraplength=300, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
         question = tk.StringVar(value="Tại sao nước này được đánh giá như vậy?")
-        entry = ttk.Entry(popup, textvariable=question)
-        entry.pack(fill="x", padx=12, pady=(0, 8))
-        response = tk.Text(popup, height=8, wrap="word", font=("Segoe UI", 10),
+        entry = ttk.Entry(panel, textvariable=question)
+        entry.pack(fill="x", pady=(4, 6))
+        response_row = ttk.Frame(panel)
+        response_row.pack(fill="both", expand=True)
+        response = tk.Text(response_row, height=8, wrap="word", font=("Segoe UI", 10),
                            bg="#302d29", fg="#f2eee8", borderwidth=0,
-                           padx=14, pady=12)
-        response.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+                           padx=10, pady=8)
+        response.pack(side="left", fill="both", expand=True)
+        response_scroll = ttk.Scrollbar(response_row, command=response.yview)
+        response_scroll.pack(side="right", fill="y")
+        response.configure(yscrollcommand=response_scroll.set)
         chosen_ply = self.ply
         before_board = self.positions[chosen_ply - 1].copy(stack=True)
         played_move = self.moves[chosen_ply - 1]
-        assessment_holder: dict = {"value": None}
+        after_board = before_board.copy(stack=True)
+        after_board.push(played_move)
+        assessment_holder: dict = {"value": None, "deep": None}
+        deep_future: dict = {"value": None}
         line_state: dict = {"moves": [], "index": 0, "board": None}
+        demonstration: dict = {"job": None, "moves": [], "index": 0, "board": None}
+        answer_generation = 0
 
         def find_assessment() -> dict | None:
             for mode in (self.full, not self.full):
@@ -1706,31 +1786,122 @@ class ChessReviewApp:
                     return cached["assessment"]
             return self.overview_assessments.get(chosen_ply)
 
-        def answer(attempt: int = 0) -> None:
-            if not popup.winfo_exists():
+        def stop_demonstration() -> None:
+            job = demonstration["job"]
+            if job is not None and panel.winfo_exists():
+                panel.after_cancel(job)
+            demonstration["job"] = None
+
+        def animate_next() -> None:
+            demonstration["job"] = None
+            if not panel.winfo_exists() or self.review_stage != "step":
                 return
-            assessment = assessment_holder["value"] or find_assessment()
+            moves = demonstration["moves"]
+            index = demonstration["index"]
+            expected = demonstration["board"]
+            if expected is None or index >= len(moves):
+                return
+            current = self.positions[self.ply]
+            if current.fen() != expected.fen():
+                append_note("Bạn đã đổi vị trí trên bàn nên mình dừng minh họa.")
+                return
+            move = moves[index]
+            if move not in current.legal_moves:
+                append_note("Biến thể không còn hợp lệ từ vị trí hiện tại.")
+                return
+            san = current.san(move)
+            self._play_move(move)
+            expected.push(move)
+            demonstration["index"] = index + 1
+            append_note(f"{index + 1}/{len(moves)} · {san}")
+            if index + 1 < len(moves):
+                demonstration["job"] = panel.after(800, animate_next)
+            else:
+                append_note("Đã đi hết biến thể minh họa. Bạn có thể tự thử nước khác trên bàn.")
+
+        def start_demonstration(assessment: dict) -> None:
+            pv = assessment.get("played_pv", [])
+            if not pv or pv[0] != played_move:
+                append_note("Stockfish chưa trả về biến thể tiếp theo để minh họa.")
+                return
+            if (self.review_stage != "step" or chosen_ply > len(self.moves)
+                    or self.positions[chosen_ply - 1].fen() != before_board.fen()
+                    or self.moves[chosen_ply - 1] != played_move):
+                append_note("Vị trí đã thay đổi. Hãy chọn lại nước cần giải thích.")
+                return
+            self._go_to(chosen_ply - 1)
+            demonstration.update({"moves": pv[:], "index": 0,
+                                  "board": before_board.copy(stack=True)})
+            append_note("Mình sẽ đi nước bạn chọn và các câu trả lời Stockfish dự kiến trên bàn.")
+            demonstration["job"] = panel.after(250, animate_next)
+
+        def answer(generation: int, attempt: int = 0) -> None:
+            if not panel.winfo_exists():
+                return
+            if generation != answer_generation:
+                return
+            assessment = assessment_holder["deep"] or find_assessment() or assessment_holder["value"]
             if assessment is None and attempt < 30:
                 response.delete("1.0", "end")
                 response.insert("1.0", "Bruno đang xem lại vị trí và các biến thể…")
-                popup.after(500, lambda: answer(attempt + 1))
+                panel.after(500, lambda: answer(generation, attempt + 1))
                 return
+            if (assessment is not None and len(assessment.get("played_pv", [])) < 3
+                    and not after_board.is_game_over()):
+                future = deep_future["value"]
+                if future is None:
+                    try:
+                        path = resolve_engine(self.engine_var.get())
+                        future = self.executor.submit(
+                            self.analysis_engine.run, path, before_board.copy(stack=True),
+                            played_move, after_board.copy(stack=True), False, 2.0, False,
+                        )
+                        deep_future["value"] = future
+                    except FileNotFoundError:
+                        future = None
+                if future is not None and not future.done():
+                    response.delete("1.0", "end")
+                    response.insert("1.0", "Bruno đang phân tích sâu để tìm chuỗi nước minh họa…")
+                    panel.after(150, lambda: answer(generation, attempt + 1))
+                    return
+                if future is not None:
+                    try:
+                        assessment = future.result()["assessment"]
+                        assessment_holder["deep"] = assessment
+                    except Exception as exc:
+                        self.status_var.set(f"Bruno không phân tích sâu được: {exc}")
             if assessment is None:
                 content = "Chưa lấy được dữ liệu từ Stockfish. Hãy kiểm tra đường dẫn engine rồi thử lại."
             else:
                 assessment_holder["value"] = assessment
+                panel.configure(text=f"Bruno · {before_board.san(played_move)} — {LABELS[assessment['category']][0]}")
+                mood = COACH_MOODS.get(assessment["category"], "neutral")
+                images = self.coach_images.get(mood)
+                if images:
+                    popup_image_label.configure(image=images["popup"])
                 content = explain_move(before_board, played_move, assessment, question.get())
                 if assessment.get("best_pv"):
                     content += "\n\nBấm ‘Đi nước mạnh nhất trên bàn’ để xem quân di chuyển thật, rồi bấm ‘Xem tiếp biến thể’."
                     best_button.configure(state="normal")
             response.delete("1.0", "end")
             response.insert("1.0", content)
+            response.yview_moveto(0.0)
+            if assessment is not None:
+                start_demonstration(assessment)
+
+        def request_answer() -> None:
+            nonlocal answer_generation
+            stop_demonstration()
+            answer_generation += 1
+            answer(answer_generation)
 
         def append_note(note: str) -> None:
+            top, _ = response.yview()
             response.insert("end", f"\n\nBruno: {note}")
-            response.see("end")
+            response.yview_moveto(top)
 
         def play_best() -> None:
+            stop_demonstration()
             assessment = assessment_holder["value"]
             pv = assessment.get("best_pv", []) if assessment else []
             if not pv or self.review_stage != "step" or chosen_ply > len(self.moves):
@@ -1754,6 +1925,7 @@ class ChessReviewApp:
             append_note(f"Đã đi {san} trên bàn. Đây là nước Stockfish chọn từ vị trí trước nước bạn hỏi.")
 
         def play_next() -> None:
+            stop_demonstration()
             moves = line_state["moves"]
             index = line_state["index"]
             expected = line_state["board"]
@@ -1774,20 +1946,42 @@ class ChessReviewApp:
             next_button.configure(state="normal" if index + 1 < len(moves) else "disabled")
             append_note(f"Tiếp theo {san}. Bạn có thể dừng ở đây và tự thử nước khác trên bàn.")
 
-        buttons = ttk.Frame(popup, padding=(12, 0, 12, 12))
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Giải thích", command=answer,
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(buttons, text="Giải thích", command=request_answer,
                    style="Accent.TButton").pack(side="left")
         best_button = ttk.Button(buttons, text="Đi nước mạnh nhất trên bàn",
                                  command=play_best, state="disabled")
         best_button.pack(side="left", padx=6)
-        next_button = ttk.Button(buttons, text="Xem tiếp biến thể", command=play_next,
+        more_buttons = ttk.Frame(panel)
+        more_buttons.pack(fill="x", pady=(4, 0))
+        next_button = ttk.Button(more_buttons, text="Xem tiếp biến thể", command=play_next,
                                  state="disabled")
         next_button.pack(side="left")
-        entry.bind("<Return>", lambda _event: answer())
-        answer()
+        entry.bind("<Return>", lambda _event: request_answer())
+        response.insert("1.0", "Nhấn Giải thích để nghe Bruno và xem biến thể tự chạy trên bàn cờ.")
+
+        def close_panel() -> None:
+            stop_demonstration()
+            self.coach_close = None
+            self.coach_panel = None
+            if panel.winfo_exists():
+                panel.destroy()
+            if self.review_stage == "step":
+                self.move_list.configure(height=5 if self.full else 7)
+                self.analysis_separator.pack(fill="x", pady=12, before=self.full_row)
+                self.grade_section.pack(fill="x", before=self.full_row)
+                self.move_list.pack(fill="x", before=self.analysis_separator)
+                if self.full:
+                    self.full_frame.pack(fill="both", expand=True, pady=(0, 5), before=self.status_label)
+                else:
+                    self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
+
+        ttk.Button(more_buttons, text="Đóng giải thích", command=close_panel).pack(side="left", padx=6)
+        self.coach_close = close_panel
 
     def _close(self) -> None:
+        self._dismiss_coach_panel()
         self.stats_cancel.set()
         self.overview_cancel.set()
         self._stop_autoplay()

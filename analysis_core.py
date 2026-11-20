@@ -70,28 +70,57 @@ def _is_book_move(board: chess.Board, move: chess.Move) -> bool:
     return chess.polyglot.zobrist_hash(after) in BOOK_POSITIONS
 
 
-def _is_clear_sacrifice(board: chess.Board, move: chess.Move, pv: list[chess.Move]) -> bool:
+PIECE_VALUES = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9,
+}
+
+
+def _material_balance(board: chess.Board, color: chess.Color) -> int:
+    return sum(
+        PIECE_VALUES.get(piece.piece_type, 0) * (1 if piece.color == color else -1)
+        for piece in board.piece_map().values()
+    )
+
+
+def material_offer(board: chess.Board, move: chess.Move,
+                   pv: list[chess.Move]) -> dict | None:
+    """Describe a captured offered piece and the mover's immediate reply."""
     piece = board.piece_at(move.from_square)
     if piece is None or piece.piece_type not in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
-        return False
-    if len(pv) < 2 or pv[0] != move:
-        return False
-    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
-              chess.ROOK: 5, chess.QUEEN: 9}
+        return None
+    if len(pv) < 3 or pv[0] != move or move not in board.legal_moves:
+        return None
     victim = board.piece_at(move.to_square)
-    gained = values.get(victim.piece_type, 0) if victim else 0
-    if values[piece.piece_type] - gained < 2:
-        return False
+    gained = PIECE_VALUES.get(victim.piece_type, 0) if victim else 0
+    if PIECE_VALUES[piece.piece_type] - gained < 2:
+        return None
+    starting_balance = _material_balance(board, board.turn)
     after = board.copy(stack=False)
     after.push(move)
     reply = pv[1]
     if reply not in after.legal_moves:
-        return False
+        return None
     target = after.piece_at(reply.to_square)
-    return bool(
-        after.is_capture(reply) and target is not None
-        and target.color == board.turn and reply.to_square == move.to_square
-    )
+    if not (after.is_capture(reply) and target is not None
+            and target.color == board.turn and reply.to_square == move.to_square):
+        return None
+    reply_san = after.san(reply)
+    after.push(reply)
+    followup = pv[2]
+    if followup not in after.legal_moves:
+        return None
+    followup_san = after.san(followup)
+    followup_capture = after.piece_at(followup.to_square)
+    after.push(followup)
+    return {
+        "piece_type": piece.piece_type,
+        "reply_san": reply_san,
+        "followup_san": followup_san,
+        "followup_check": after.is_check(),
+        "followup_capture_type": followup_capture.piece_type if followup_capture else None,
+        "net_material_loss": starting_balance - _material_balance(after, board.turn),
+    }
 
 
 def classify_move(
@@ -110,12 +139,13 @@ def classify_move(
     best_pv = best_info.get("pv", [])
     played_pv = played_info.get("pv", [])
     exact_best = bool(best_pv and best_pv[0] == move)
+    offer = material_offer(board, move, played_pv)
 
     if board.legal_moves.count() == 1:
         category = "forced"
     elif _is_book_move(board, move) and ep_loss <= 0.05:
         category = "book"
-    elif (ep_loss <= 0.02 and _is_clear_sacrifice(board, move, played_pv)
+    elif (ep_loss <= 0.02 and offer is not None and offer["net_material_loss"] >= 2
           and played_ep >= 0.45 and best_ep < 0.90):
         category = "brilliant"
     elif exact_best and second_info is not None and (
@@ -153,6 +183,7 @@ def classify_move(
         "played_pv": played_pv[:8],
         "best_ep": best_ep,
         "played_ep": played_ep,
+        "material_offer": offer,
     }
 
 
@@ -165,6 +196,8 @@ def assess_move(
     # this severe label so a long PGN overview remains responsive.
     if result["category"] == "blunder" and seconds < 1.5:
         result = _assess_move_once(engine, board, move, 1.5)
+    elif result["category"] == "brilliant" and seconds < 2.0:
+        result = _assess_move_once(engine, board, move, 2.0)
     return result
 
 

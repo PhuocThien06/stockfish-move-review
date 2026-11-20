@@ -3,3 +3,7 @@ Source pattern: https://www.chess.com/chess-themes/pieces/neo/64/{color}{piece}.
 Rights in these images belong to Chess.com. They are bundled here for the
 user's personal, local chess review project. Check Chess.com's terms before
 redistributing them beyond a private repository.
+
+The bruno_angry.png, bruno_thinking.png, and bruno_celebrating.png chibi
+reaction illustrations were generated for this personal project with OpenAI
+image generation, using bruno_coach.png as the visual reference.
