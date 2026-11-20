@@ -159,8 +159,8 @@ def format_stats(stats: dict) -> str:
         lines.append(f"  Cần luyện thêm: {max(enough, key=lambda item: item[1])[0]}")
     else:
         lines.append("  Cần thêm ván để so sánh các giai đoạn.")
-    lines.extend(["", "Ghi chú: Dùng ngưỡng Expected Points của Chess.com với WDL từ Stockfish.",
-                  "Các nhãn đặc biệt vẫn là ước lượng; Chess.com còn dùng Elo và quy tắc riêng.",
+    lines.extend(["", "Ghi chú: Dùng ngưỡng Expected Points của Chess.com với mô hình tỷ lệ thắng Lichess.",
+                  "Các nhãn vẫn là ước lượng; Chess.com còn dùng Elo và quy tắc riêng.",
                   "Khai cuộc: 12 lượt đầu; tàn cuộc: còn tối đa 12 quân trên bàn.",
                   "Các tình huống chiếu hết được giới hạn 1000 cp khi tính trung bình."])
     return "\n".join(lines)
@@ -179,7 +179,7 @@ def compute_overview(
         for index, move in enumerate(moves, 1):
             if cancel.is_set():
                 return {"cancelled": True}
-            assessment = assess_move(engine, board, move, 0.20)
+            assessment = assess_move(engine, board, move, 0.45)
             assessments.append(assessment)
             progress.put((generation, "move", index, len(moves), assessment))
             board.push(move)
@@ -233,6 +233,7 @@ class ChessReviewApp:
         self.generation = 0
         self.analysis_cache: dict[tuple[int, bool], dict] = {}
         self.score_cache: dict[int, tuple[chess.engine.Score | None, float]] = {}
+        self.best_arrow_cache: dict[int, chess.Move] = {}
         self.reviewing = False
         self.review_stage = "manual"
         self.full = False
@@ -255,11 +256,12 @@ class ChessReviewApp:
         self.ply = 0
         self.engine_var = tk.StringVar(value=str(APP_HOME / "engine" / "stockfish.exe"))
         self.username_var = tk.StringVar(value="TheFallenWizard")
-        self.seconds_var = tk.StringVar(value="2")
+        self.seconds_var = tk.StringVar(value="3")
         self.status_var = tk.StringVar(value="Tự đi cả hai bên hoặc dán PGN; dữ liệu lưu trong D:\\Chess\\data.")
         self.grade_var = tk.StringVar(value="Chưa có nước đi")
         self.detail_var = tk.StringVar(value="")
         self.eval_var = tk.StringVar(value="0.00")
+        self.bar_orientation_var = tk.StringVar(value="Thanh đánh giá: Đen ở trên, Trắng ở dưới")
         self.game_var = tk.StringVar(value="")
         self._build_ui()
         self._render_board()
@@ -400,7 +402,7 @@ class ChessReviewApp:
         self.grade_label = ttk.Label(self.analysis_panel, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
         self.grade_label.pack(anchor="w", pady=(5, 0))
         ttk.Label(self.analysis_panel, textvariable=self.detail_var).pack(anchor="w")
-        ttk.Label(self.analysis_panel, text="Thanh đánh giá: Đen ở trên, Trắng ở dưới").pack(anchor="w", pady=(6, 0))
+        ttk.Label(self.analysis_panel, textvariable=self.bar_orientation_var).pack(anchor="w", pady=(6, 0))
         ttk.Label(self.analysis_panel, textvariable=self.eval_var).pack(anchor="w")
 
         full_row = ttk.Frame(self.analysis_panel)
@@ -414,7 +416,7 @@ class ChessReviewApp:
         self.coach_button.pack(side="left", padx=(7, 0))
         ttk.Label(full_row, text="Giây/vị trí:").pack(side="left", padx=(10, 3))
         self.seconds_combo = ttk.Combobox(full_row, textvariable=self.seconds_var,
-                                          values=("1", "2", "5", "10"), width=4, state="readonly")
+                                          values=("1", "2", "3", "5", "10"), width=4, state="readonly")
         self.seconds_combo.pack(side="left")
         self.seconds_combo.bind("<<ComboboxSelected>>", self._analysis_settings_changed)
         self.full_frame = ttk.LabelFrame(self.analysis_panel, text="Phân tích sâu", padding=8)
@@ -471,8 +473,10 @@ class ChessReviewApp:
             self._request_analysis()
 
     def _analysis_settings_changed(self, _event: tk.Event) -> None:
-        self._reset_analysis_cache()
-        if self.review_stage != "overview":
+        self.analysis_cache = {
+            key: value for key, value in self.analysis_cache.items() if not key[1]
+        }
+        if self.review_stage != "overview" and self.full:
             self._request_analysis()
 
     def _sync_games_on_start(self) -> None:
@@ -850,6 +854,8 @@ class ChessReviewApp:
                 if kind == "move":
                     _, _, index, total, assessment = event
                     self.overview_assessments[index] = assessment
+                    if assessment.get("best_pv"):
+                        self.best_arrow_cache[index - 1] = assessment["best_pv"][0]
                     side = "white" if index % 2 else "black"
                     code = assessment["category"]
                     self.overview_counts[side][code] += 1
@@ -859,6 +865,8 @@ class ChessReviewApp:
                     self.overview_intro.set(f"Đã phân tích {index}/{total} nước · Đang chuẩn bị thanh đánh giá và thống kê.")
                     if self.review_stage == "step" and self.ply == index:
                         self._draw_bar(*self.score_cache[index])
+                    if self.review_stage == "step" and self.ply == index - 1:
+                        self._render_board()
                     self._draw_overview_chart()
                 else:
                     try:
@@ -960,10 +968,12 @@ class ChessReviewApp:
             self.future.cancel()
         self.analysis_cache.clear()
         self.score_cache.clear()
+        self.best_arrow_cache.clear()
 
     def _flip(self) -> None:
         self.flipped = not self.flipped
         self._render_board()
+        self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
 
     def _event_square(self, event: tk.Event) -> int | None:
         file_index = event.x // SQUARE
@@ -1214,6 +1224,7 @@ class ChessReviewApp:
                 "positions": self.positions[:],
                 "analysis_cache": self.analysis_cache.copy(),
                 "score_cache": self.score_cache.copy(),
+                "best_arrow_cache": self.best_arrow_cache.copy(),
                 "overview_assessments": self.overview_assessments.copy(),
                 "overview_points": self.overview_points[:],
                 "current_game_path": self.current_game_path,
@@ -1232,6 +1243,8 @@ class ChessReviewApp:
                                if key[0] <= branch_from}
         self.score_cache = {key: value for key, value in self.score_cache.items()
                             if key <= branch_from}
+        self.best_arrow_cache = {key: value for key, value in self.best_arrow_cache.items()
+                                 if key <= branch_from}
         self.overview_assessments = {
             key: value for key, value in self.overview_assessments.items()
             if key <= branch_from
@@ -1282,6 +1295,7 @@ class ChessReviewApp:
         self.positions = original["positions"]
         self.analysis_cache = original["analysis_cache"]
         self.score_cache = original["score_cache"]
+        self.best_arrow_cache = original["best_arrow_cache"]
         self.overview_assessments = original["overview_assessments"]
         self.overview_points = original["overview_points"]
         self.current_game_path = original["current_game_path"]
@@ -1477,6 +1491,11 @@ class ChessReviewApp:
                 x, y = col * SQUARE, row * SQUARE
                 self.board_canvas.create_rectangle(x, y, x + SQUARE, y + SQUARE,
                                                    fill=color, outline=color)
+        if self.reviewing and self.review_stage == "step":
+            suggested = self.best_arrow_cache.get(self.ply)
+            if suggested is not None and suggested in board.legal_moves:
+                self._draw_arrow(suggested.from_square, suggested.to_square,
+                                 "engine_best_arrow")
         for start, end in sorted(self.arrows):
             self._draw_arrow(start, end, "annotation_arrow")
         legal_targets = set()
@@ -1555,9 +1574,18 @@ class ChessReviewApp:
 
     def _draw_bar(self, score: chess.engine.Score | None, white_ep: float = 0.5) -> None:
         self.bar.delete("all")
-        white_height = int(BOARD_SIZE * max(0.02, min(0.98, white_ep)))
-        self.bar.create_rectangle(0, 0, 40, BOARD_SIZE - white_height, fill="#252525", outline="")
-        self.bar.create_rectangle(0, BOARD_SIZE - white_height, 40, BOARD_SIZE, fill="#f3f3f3", outline="")
+        self.bar_orientation_var.set(
+            "Thanh đánh giá: Trắng ở trên, Đen ở dưới" if self.flipped
+            else "Thanh đánh giá: Đen ở trên, Trắng ở dưới"
+        )
+        bottom_share = 1 - white_ep if self.flipped else white_ep
+        bottom_height = int(BOARD_SIZE * max(0.02, min(0.98, bottom_share)))
+        top_color = "#f3f3f3" if self.flipped else "#252525"
+        bottom_color = "#252525" if self.flipped else "#f3f3f3"
+        self.bar.create_rectangle(0, 0, 40, BOARD_SIZE - bottom_height,
+                                  fill=top_color, outline="")
+        self.bar.create_rectangle(0, BOARD_SIZE - bottom_height, 40, BOARD_SIZE,
+                                  fill=bottom_color, outline="")
         self.eval_var.set(score_text(score) if score else "0.00")
 
     def _request_analysis(self) -> None:
@@ -1571,9 +1599,9 @@ class ChessReviewApp:
             self.status_var.set("Chọn stockfish.exe để bắt đầu phân tích.")
             return
         try:
-            seconds = float(self.seconds_var.get()) if self.full else 0.60
+            seconds = float(self.seconds_var.get()) if self.full else 1.0
         except ValueError:
-            seconds = 2.0
+            seconds = 3.0
         previous = self.positions[self.ply - 1].copy(stack=True) if self.ply else None
         move = self.moves[self.ply - 1] if self.ply else None
         current = self.positions[self.ply].copy(stack=True)
@@ -1582,7 +1610,8 @@ class ChessReviewApp:
             return
         self.status_var.set("Đang phân tích sâu…" if self.full else "Đang đánh giá nước vừa đi…")
         self.future = self.executor.submit(
-            self.analysis_engine.run, path, previous, move, current, self.full, seconds,
+            self.analysis_engine.run, path, previous, move, current, self.full,
+            seconds, self.reviewing and self.review_stage == "step",
         )
         self.future.add_done_callback(lambda future: self.results.put((generation, future)))
 
@@ -1607,6 +1636,13 @@ class ChessReviewApp:
         self.root.after(100, self._poll_results)
 
     def _display_analysis(self, result: dict) -> None:
+        if self.reviewing and self.review_stage == "step":
+            suggested = result.get("next_best_move")
+            if suggested is not None and suggested in self.positions[self.ply].legal_moves:
+                self.best_arrow_cache[self.ply] = suggested
+            else:
+                self.best_arrow_cache.pop(self.ply, None)
+            self._render_board()
         category = result["category"]
         name, color = LABELS.get(category, ("Vị trí ban đầu", "#ede9e1"))
         self.grade_var.set(name)

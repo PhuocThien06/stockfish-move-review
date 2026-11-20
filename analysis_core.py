@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import struct
 import subprocess
@@ -46,21 +45,21 @@ def open_engine(path: str) -> chess.engine.SimpleEngine:
 
 def configure_engine(engine: chess.engine.SimpleEngine, full: bool) -> None:
     engine.configure({
-        "Threads": max(1, os.cpu_count() or 1) if full else 1,
-        "Hash": 256 if full else 32,
-        "UCI_ShowWDL": True,
+        "Threads": max(1, os.cpu_count() or 1) if full else min(2, os.cpu_count() or 1),
+        "Hash": 256 if full else 64,
+        "UCI_ShowWDL": False,
     })
 
 
 def expected_points(info: dict, color: chess.Color) -> float:
-    if "wdl" in info:
-        return info["wdl"].pov(color).expectation()
     score = info["score"].pov(color)
     mate = score.mate()
     if mate is not None:
         return 1.0 if mate > 0 else 0.0
-    cp = score.score() or 0
-    return 1 / (1 + math.exp(-max(-1500, min(1500, cp)) / 300))
+    # Lichess derives this win-chance curve from played games. Stockfish's
+    # UCI WDL instead models engine self-play, which exaggerates a human
+    # player's expected-points loss when combined with Chess.com cutoffs.
+    return score.wdl(model="lichess").expectation()
 
 
 def _is_book_move(board: chess.Board, move: chess.Move) -> bool:
@@ -161,6 +160,18 @@ def assess_move(
     engine: chess.engine.SimpleEngine, board: chess.Board,
     move: chess.Move, seconds: float,
 ) -> dict:
+    result = _assess_move_once(engine, board, move, seconds)
+    # A short search can mistake a tactical move for a blunder. Recheck only
+    # this severe label so a long PGN overview remains responsive.
+    if result["category"] == "blunder" and seconds < 1.5:
+        result = _assess_move_once(engine, board, move, 1.5)
+    return result
+
+
+def _assess_move_once(
+    engine: chess.engine.SimpleEngine, board: chess.Board,
+    move: chess.Move, seconds: float,
+) -> dict:
     limit = chess.engine.Limit(time=seconds)
     move_count = board.legal_moves.count()
     best_lines = engine.analyse(
@@ -203,10 +214,12 @@ def analyze_position(
     current: chess.Board,
     full: bool,
     seconds: float,
+    show_best_arrow: bool = False,
 ) -> dict:
     result = {
         "category": "", "detail": "", "score": None, "white_ep": 0.5,
         "best_prior": "", "lines": [], "assessment": None,
+        "next_best_move": None,
     }
     if before is not None and played_move is not None:
         assessment = assess_move(engine, before, played_move, seconds)
@@ -224,9 +237,12 @@ def analyze_position(
         })
     elif not current.is_game_over():
         info = engine.analyse(current, chess.engine.Limit(time=seconds),
-                              info=chess.engine.INFO_SCORE)
+                              info=(chess.engine.INFO_SCORE | chess.engine.INFO_PV
+                                    if show_best_arrow else chess.engine.INFO_SCORE))
         result["score"] = info["score"].pov(chess.WHITE)
         result["white_ep"] = expected_points(info, chess.WHITE)
+        if show_best_arrow and info.get("pv"):
+            result["next_best_move"] = info["pv"][0]
 
     if full and not current.is_game_over():
         lines = engine.analyse(
@@ -246,6 +262,17 @@ def analyze_position(
         if lines:
             result["score"] = lines[0]["score"].pov(chess.WHITE)
             result["white_ep"] = expected_points(lines[0], chess.WHITE)
+            if lines[0].get("pv"):
+                result["next_best_move"] = lines[0]["pv"][0]
+    elif show_best_arrow and before is not None and not current.is_game_over():
+        next_info = engine.analyse(
+            current, chess.engine.Limit(time=seconds),
+            info=chess.engine.INFO_SCORE | chess.engine.INFO_PV,
+        )
+        result["score"] = next_info["score"].pov(chess.WHITE)
+        result["white_ep"] = expected_points(next_info, chess.WHITE)
+        if next_info.get("pv"):
+            result["next_best_move"] = next_info["pv"][0]
     return result
 
 
@@ -279,11 +306,14 @@ class EngineSession:
     def run(
         self, path: str, before: chess.Board | None, move: chess.Move | None,
         current: chess.Board, full: bool, seconds: float,
+        show_best_arrow: bool = False,
     ) -> dict:
         for attempt in range(2):
             try:
                 self._ensure(path, full)
-                return analyze_position(self.engine, before, move, current, full, seconds)
+                return analyze_position(
+                    self.engine, before, move, current, full, seconds, show_best_arrow,
+                )
             except (chess.engine.EngineTerminatedError, BrokenPipeError, OSError):
                 self.close()
                 if attempt:
