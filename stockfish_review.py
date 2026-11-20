@@ -902,6 +902,7 @@ class ChessReviewApp:
                     self.overview_intro.set(f"Đã phân tích {index}/{total} nước · Đang chuẩn bị thanh đánh giá và thống kê.")
                     if self.review_stage == "step" and self.ply == index:
                         self._draw_bar(*self.score_cache[index])
+                        self._render_board()
                     if self.review_stage == "step" and self.ply == index - 1:
                         self._render_board()
                     self._draw_overview_chart()
@@ -1614,7 +1615,33 @@ class ChessReviewApp:
                                                   text=chess.FILE_NAMES[file_], anchor="se",
                                                   font=("Segoe UI", 8, "bold"),
                                                   fill="#ffffff" if (file_ + rank_) % 2 == 0 else "#333333")
+        self._draw_board_grade()
         self._render_material()
+
+    def _draw_board_grade(self) -> None:
+        """Place the current move's grade by the piece that just moved."""
+        if not self.ply or self.review_stage == "overview":
+            return
+        assessment = (self.analysis_cache.get((self.ply, self.full))
+                      or self.analysis_cache.get((self.ply, not self.full)))
+        if assessment is None and self.reviewing:
+            assessment = self.overview_assessments.get(self.ply)
+        category = assessment.get("category") if assessment else None
+        if category not in LABELS:
+            return
+        square = self.moves[self.ply - 1].to_square
+        if self.positions[self.ply].piece_at(square) is None:
+            return
+        col = 7 - chess.square_file(square) if self.flipped else chess.square_file(square)
+        row = chess.square_rank(square) if self.flipped else 7 - chess.square_rank(square)
+        size = 30
+        center_x = max(size / 2 + 2, min(BOARD_SIZE - size / 2 - 2,
+                                       (col + 1) * SQUARE - 5))
+        center_y = max(size / 2 + 2, min(BOARD_SIZE - size / 2 - 2,
+                                       row * SQUARE + 5))
+        draw_badge(self.board_canvas, category, size,
+                   origin=(center_x - size / 2, center_y - size / 2),
+                   clear=False, tag="move_grade")
 
     def _render_material(self) -> None:
         self.material_state = material_snapshot(self.positions[0], self.moves, self.ply)
@@ -1728,7 +1755,6 @@ class ChessReviewApp:
                 self.best_arrow_cache[self.ply] = suggested
             else:
                 self.best_arrow_cache.pop(self.ply, None)
-            self._render_board()
         category = result["category"]
         name, color = LABELS.get(category, ("Vị trí ban đầu", "#ede9e1"))
         self.grade_var.set(name)
@@ -1737,6 +1763,7 @@ class ChessReviewApp:
         self._set_coach_mood(category)
         self.detail_var.set(result["detail"])
         self._draw_bar(result["score"], result["white_ep"])
+        self._render_board()
         if self.full:
             notes = []
             if self.ply and result["best_prior"]:
