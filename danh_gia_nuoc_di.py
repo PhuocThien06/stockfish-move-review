@@ -8,6 +8,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from analysis_core import LABELS, assess_move, configure_engine, open_engine
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -56,21 +58,8 @@ def engine_path(value: str) -> str:
     if path.is_file():
         return str(path.resolve())
     raise FileNotFoundError(
-        "Không tìm thấy Stockfish. Hãy thêm --stockfish \"C:\\duong-dan\\stockfish.exe\"."
+        "Không tìm thấy Stockfish. Hãy thêm --stockfish \"D:\\Chess\\engine\\stockfish.exe\"."
     )
-
-
-def label_for_loss(loss: int) -> str:
-    # Các ngưỡng đơn giản để tham khảo; không phải nhãn Game Review của Chess.com.
-    if loss <= 20:
-        return "Rất tốt"
-    if loss <= 50:
-        return "Tốt"
-    if loss <= 100:
-        return "Chưa chính xác"
-    if loss <= 250:
-        return "Sai lầm"
-    return "Sai lầm lớn"
 
 
 def evaluate_move(
@@ -78,26 +67,10 @@ def evaluate_move(
     board: chess.Board,
     move: chess.Move,
     seconds: float,
-    game_token: object,
 ) -> tuple[str, str]:
-    limit = chess.engine.Limit(time=seconds)
-    # Chỉ lấy điểm số. Không đọc hoặc hiển thị PV / bestmove.
-    best_info = engine.analyse(
-        board, limit, game=game_token, info=chess.engine.INFO_SCORE
-    )
-    played_info = engine.analyse(
-        board, limit, game=game_token, info=chess.engine.INFO_SCORE,
-        root_moves=[move],
-    )
-    best_score = best_info["score"].pov(board.turn)
-    played_score = played_info["score"].pov(board.turn)
-    best = best_score.score(mate_score=100_000)
-    played = played_score.score(mate_score=100_000)
-    if best is None or played is None:
-        raise RuntimeError("Stockfish không trả về điểm đánh giá cho vị trí này.")
-    loss = max(0, best - played)
-    detail = "thế chiếu hết" if best_score.is_mate() or played_score.is_mate() else f"lệch {loss} cp"
-    return label_for_loss(loss), detail
+    result = assess_move(engine, board, move, seconds)
+    detail = f"mất {result['ep_loss'] * 100:.1f}% điểm kỳ vọng"
+    return LABELS[result["category"]][0], detail
 
 
 def review_game(
@@ -112,7 +85,6 @@ def review_game(
     black = game.headers.get("Black", "Đen")
     print(f"\nVán {game_number}: {white} - {black}")
     board = game.board()
-    game_token = object()
     count = 0
     for move in game.mainline_moves():
         color = board.turn
@@ -120,7 +92,7 @@ def review_game(
         move_number = board.fullmove_number
         name = white if color == chess.WHITE else black
         if player is None or name.casefold() == player.casefold():
-            label, detail = evaluate_move(engine, board, move, seconds, game_token)
+            label, detail = evaluate_move(engine, board, move, seconds)
             notation = f"{move_number}{'.' if color == chess.WHITE else '...'} {san}"
             print(f"  {notation:<14} {label:<16} {detail}")
             if writer is not None:
@@ -134,7 +106,8 @@ def main() -> int:
     args = parse_args()
     try:
         executable = engine_path(args.stockfish)
-        engine = chess.engine.SimpleEngine.popen_uci(executable)
+        engine = open_engine(executable)
+        configure_engine(engine, False)
     except (FileNotFoundError, OSError, chess.engine.EngineError) as exc:
         print(f"Không mở được Stockfish: {exc}", file=sys.stderr)
         return 2

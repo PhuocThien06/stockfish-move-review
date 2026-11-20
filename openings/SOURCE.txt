@@ -1,0 +1,5 @@
+Opening-position index compiled from lichess-org/chess-openings (a.tsv to e.tsv).
+Source: https://github.com/lichess-org/chess-openings
+License: CC0 1.0 / public domain, as stated by the source project.
+Each 64-bit value is a Polyglot Zobrist hash of a position along a listed
+opening line. This local file is used only to label conventional book moves.

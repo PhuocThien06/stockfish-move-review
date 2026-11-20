@@ -1,22 +1,13 @@
 # Stockfish Move Review
 
-Ứng dụng Python chạy trên máy để xem lại và đánh giá các ván cờ. Toàn bộ dự án nằm trong `D:\Chess`; PGN và báo cáo nằm trong `D:\Chess\data`. Ứng dụng không đăng nhập, kết nối hoặc tự lấy dữ liệu từ Chess.com.
+Ứng dụng Python chạy trên Windows để tự đi cả hai bên, đánh giá nước vừa đi và xem lại những ván đã kết thúc. Mã nguồn, Stockfish, môi trường Python, PGN và báo cáo đều nằm trong `D:\Chess`.
 
-## Tính năng
+Đây là ứng dụng độc lập, không liên kết hay được Chess.com bảo trợ. Ứng dụng chỉ dùng [PubAPI công khai](https://support.chess.com/en/articles/9650547-what-is-the-pubapi-and-how-do-i-use-it) để đồng bộ các ván đã kết thúc; không đăng nhập, đọc ván đang diễn ra hay điều khiển bàn cờ trên trang web.
 
-- **Bàn cờ thường:** bạn tự đi cả Trắng và Đen bằng cách bấm quân hoặc nhập SAN/UCI. Stockfish chỉ chấm nước vừa đi và cập nhật thanh đánh giá; không đi quân và không hiển thị nước tiếp theo. Ván được tự lưu sau từng nước vào `D:\Chess\data\games`.
-- **Dán PGN:** sao chép mã PGN, dán vào ứng dụng; ván được lưu vào `D:\Chess\data\games` rồi mở để xem lại. Cũng có thể mở tệp `.pgn` có sẵn; ứng dụng lưu một bản sao trên ổ D.
-- **Xem lại ván:** dùng nút ◀ ▶ hoặc chọn nước trong danh sách.
-- **Full công suất:** chỉ bật khi xem lại ván. Hiển thị nước mạnh nhất ở lượt vừa qua, tối đa ba phương án tiếp theo và các dòng biến ngắn. Có thể chọn thời gian phân tích mỗi vị trí.
-- **Thống kê nâng cao:** chấm các nước của một người chơi qua những ván PGN đã mở; tổng hợp tỷ lệ nước tốt/sai lầm, độ lệch trung bình, theo giai đoạn và theo màu quân. Báo cáo `.txt` lưu trong `D:\Chess\data\reports`.
-- **Dòng lệnh:** `danh_gia_nuoc_di.py` để chấm cả tệp PGN và tùy chọn xuất CSV.
-
-Nhãn *Best Move*, *Tốt*, *Sai lầm*... là ước lượng từ Stockfish trong ứng dụng này, không phải hệ thống phân loại độc quyền của Chess.com. Tăng thời gian phân tích để kết quả ổn định hơn.
-
-## Cài đặt trên Windows
+## Cách chạy
 
 1. Cài Python 3.10 trở lên từ [python.org](https://www.python.org/downloads/).
-2. Đặt mã nguồn trong `D:\Chess`. Trong PowerShell, tạo môi trường Python ngay trong dự án và cài thư viện:
+2. Mở PowerShell và cài thư viện trong ổ D:
 
    ```powershell
    cd D:\Chess
@@ -24,25 +15,38 @@ Nhãn *Best Move*, *Tốt*, *Sai lầm*... là ước lượng từ Stockfish tr
    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 
-3. Tải Stockfish cho Windows từ [trang chính thức](https://stockfishchess.org/download/), giải nén và đặt bản chạy tại `D:\Chess\engine\stockfish.exe`. Tệp engine được loại khỏi GitHub.
+3. Tải Stockfish cho Windows từ [trang chính thức](https://stockfishchess.org/download/), giải nén và đặt bản chạy tại `D:\Chess\engine\stockfish.exe`. Stockfish chạy ẩn ở nền. Nếu tệp ở đường dẫn khác, bấm **Chọn tệp…** trong ứng dụng.
 4. Nhấp đúp `run.bat`, hoặc chạy:
 
    ```powershell
    .\.venv\Scripts\python.exe stockfish_review.py
    ```
 
-5. Nếu engine nằm ở đường dẫn khác, bấm **Chọn tệp…** để chọn `stockfish.exe`.
+Tên đồng bộ mặc định là **TheFallenWizard**. Khi mở ứng dụng, chương trình tự lấy các ván công khai đã kết thúc trong 30 ngày gần đây, lưu từng ván một lần vào `D:\Chess\data\games`, rồi mở ván mới nhất. Có thể sửa tên ở thanh trên cùng, bấm **Đồng bộ** hoặc mở **Ván đã lưu**. Việc tải dùng các lời gọi tuần tự tới API; nếu Chess.com giới hạn truy cập, ứng dụng hiển thị lỗi và vẫn dùng được PGN trên máy. Quyền dùng API không bảo đảm tài khoản sẽ không bao giờ bị hạn chế. Theo [Fair Play của Chess.com](https://support.chess.com/en/articles/8568369-what-do-i-need-to-know-about-fair-play-on-chess-com), không dùng Stockfish để phân tích một ván trên Chess.com khi ván đó còn đang diễn ra.
 
-Để lấy PGN trên Chess.com, mở ván đã chơi, chọn **Share → PGN → Download** hoặc sao chép nội dung PGN rồi dùng **Dán PGN…** trong ứng dụng. [Hướng dẫn Chess.com](https://support.chess.com/en/articles/8705305-how-do-i-get-a-pgn-of-my-game)
+## Sử dụng
 
-## Chấm PGN bằng dòng lệnh
+- **Bàn cờ tự đi:** bấm quân rồi bấm ô đích, hoặc giữ chuột trái kéo quân và thả. Bạn đi cả Trắng lẫn Đen. Stockfish chỉ đánh giá nước vừa đi và cập nhật thanh lợi thế; không gợi ý nước tiếp theo trong chế độ này.
+- **Đánh dấu:** bấm chuột phải lên ô để tô đỏ; giữ chuột phải kéo giữa hai ô để vẽ mũi tên vàng. Có thể vẽ nhiều mũi tên. Bấm lại bằng chuột phải hoặc bấm trái vào ô/mũi tên để xóa.
+- **PGN riêng:** bấm **Mở PGN…** hoặc **Dán PGN…**. Bản sao được lưu trên ổ D.
+- **Tổng quan ván:** khi mở PGN hoặc ván đã lưu, ứng dụng phân tích nền toàn bộ nước đi, hiện bảng phân loại Trắng/Đen và biểu đồ lợi thế. Nút **Xem lại từng nước** sáng lên khi đã chuẩn bị xong điểm cho mọi vị trí, để thanh đánh giá cập nhật ngay lúc chuyển nước.
+- **Xem từng nước:** dùng năm nút **đầu / trước / phát tự động / sau / cuối**, các phím `Home`, `←`, `→`, `End`, hoặc bấm nước trong danh sách. Nút **Lật bàn** đổi hướng nhìn.
+- **Full công suất:** chỉ có khi xem lại; dùng nhiều luồng CPU, thời gian phân tích chọn được, cho biết nước máy ưu tiên và tối đa ba biến thể từ vị trí hiện tại.
+- **Hỏi HLV Bruno:** chọn một nước rồi bấm **Hỏi HLV Bruno**. Nhập câu hỏi, ví dụ “Tại sao nước này sai?”, “Nên đi nước nào khác?” hoặc “Có chiến thuật gì?”. Phần giải thích gồm cách chấm điểm, dữ kiện kiểm chứng được trên bàn, nước thay thế và các biến thể theo ký hiệu SAN. Bruno là hình chibi minh họa, không phải người thật đang trả lời.
+- **Yêu thích:** bấm trái tim `♡` cạnh tên ván để chuyển thành `♥`. Các PGN không được yêu thích sẽ bị xóa khi ván/lần lưu đã quá 30 ngày; ván yêu thích được giữ lại. Việc dọn diễn ra lúc khởi động và mỗi ngày nếu ứng dụng mở liên tục. PGN nhiều ván được tách thành từng ván riêng để bạn yêu thích chính xác ván muốn giữ.
+- **Thống kê nâng cao:** chấm các nước của một người chơi trong PGN đã mở, tổng hợp phân loại, điểm kỳ vọng mất đi, giai đoạn và màu quân. Báo cáo lưu ở `D:\Chess\data\reports`.
+
+## Cách chương trình giải thích
+
+Stockfish trả về điểm số, xác suất thắng/hòa/thua và các biến thể; bản thân engine không viết lý do bằng tiếng Việt. Ứng dụng chấm mức giảm **điểm kỳ vọng** theo [các ngưỡng Chess.com công bố](https://support.chess.com/en/articles/8572705-how-are-moves-classified-what-is-a-blunder-or-brilliant-etc), rồi tạo lời giải thích từ ba lớp dữ kiện: (1) điểm trước và sau, (2) sự kiện thật trên bàn như chiếu, bắt quân, nhập thành, phong cấp, phát triển quân, (3) biến thể máy tính nếu đi nước khác. Những nhận xét về kế hoạch không được khẳng định nếu không thể chứng minh bằng các nước đi. Các nhãn đặc biệt như *Thiên tài*, *Rất mạnh* và *Bỏ lỡ* là ước lượng; thuật toán chính xác của Chess.com còn dùng quy tắc riêng và Elo. Chạy Full lâu hơn để kiểm tra những vị trí khó.
+
+Kho khai cuộc của ứng dụng được tạo từ [Lichess chess-openings](https://github.com/lichess-org/chess-openings) (CC0); xem `openings/SOURCE.txt`. Phân tích HLV chạy cục bộ, không gửi PGN hay câu hỏi tới dịch vụ AI.
+
+## Dòng lệnh
 
 ```powershell
-.\.venv\Scripts\python.exe danh_gia_nuoc_di.py "D:\Chess\data\games\van-co.pgn" --stockfish "D:\Chess\engine\stockfish.exe" --player "ten-cua-ban" --csv "ket-qua.csv"
+cd D:\Chess
+.\.venv\Scripts\python.exe danh_gia_nuoc_di.py "D:\Chess\data\games\van-co.pgn" --stockfish "D:\Chess\engine\stockfish.exe" --player "TheFallenWizard" --csv "ket-qua.csv"
 ```
 
-## Dữ liệu và hình quân
-
-PGN và báo cáo chỉ được lưu trong `D:\Chess\data` trên máy; thư mục này nằm trong `.gitignore` nên không được push lên GitHub. Phân tích Stockfish chạy cục bộ, không có hạn mức ván mỗi ngày từ ứng dụng này.
-
-Bàn cờ dùng tông nâu. Hình quân **Neo** lấy từ [Chess.com](https://www.chess.com/chess-themes/pieces/neo/64/wk.png) theo đúng mẫu người dùng cung cấp. Quyền đối với hình quân thuộc Chess.com; xem `pieces/ATTRIBUTION.txt`.
+PGN, báo cáo và danh sách yêu thích ở `D:\Chess\data`; thư mục này, Stockfish và `.venv` nằm trong `.gitignore`, không được đẩy lên GitHub. Hình quân Neo trong `pieces/` theo mẫu người dùng cung cấp; xem `pieces/ATTRIBUTION.txt`.

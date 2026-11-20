@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import io
-import math
-import os
+import hashlib
 import queue
 import re
 import shutil
@@ -25,6 +24,13 @@ try:
 except ImportError:
     messagebox.showerror("Thiếu thư viện", "Cài python-chess bằng lệnh:\npython -m pip install python-chess")
     raise SystemExit(2)
+
+from analysis_core import (
+    EngineSession, LABELS, assess_move, configure_engine, open_engine, score_text,
+)
+from chesscom_import import sync_recent_games
+from coach import explain_move
+from local_store import load_favorites, prune_old_games, save_favorites
 
 
 PIECES = {
@@ -61,92 +67,6 @@ def resolve_engine(value: str) -> str:
     raise FileNotFoundError("Chưa tìm thấy Stockfish. Hãy chọn tệp stockfish.exe.")
 
 
-def grade(loss: int, exact_best: bool, full: bool) -> str:
-    if full and exact_best:
-        return "Tốt nhất (Best Move)"
-    if loss <= 20:
-        return "Rất tốt"
-    if loss <= 50:
-        return "Tốt"
-    if loss <= 100:
-        return "Chưa chính xác"
-    if loss <= 250:
-        return "Sai lầm"
-    return "Sai lầm lớn"
-
-
-def score_text(score: chess.engine.Score) -> str:
-    mate = score.mate()
-    if mate is not None:
-        return f"M{mate:+d}"
-    cp = score.score()
-    return f"{cp / 100:+.2f}" if cp is not None else "?"
-
-
-def variation_text(board: chess.Board, moves: list[chess.Move], max_plies: int = 6) -> str:
-    sample = moves[:max_plies]
-    return board.variation_san(sample) if sample else ""
-
-
-def analyze(
-    engine_path: str,
-    before: chess.Board | None,
-    played_move: chess.Move | None,
-    current: chess.Board,
-    full: bool,
-    seconds: float,
-) -> dict:
-    result: dict = {"grade": "", "detail": "", "score": None, "best_prior": "", "lines": []}
-    with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
-        engine.configure({
-            "Threads": max(1, os.cpu_count() or 1) if full else 1,
-            "Hash": 256 if full else 32,
-        })
-        limit = chess.engine.Limit(time=seconds)
-        if before is not None and played_move is not None:
-            info_level = chess.engine.INFO_SCORE | (chess.engine.INFO_PV if full else 0)
-            best_info = engine.analyse(before, limit, info=info_level)
-            played_info = engine.analyse(
-                before, limit, info=chess.engine.INFO_SCORE, root_moves=[played_move]
-            )
-            best_score = best_info["score"].pov(before.turn)
-            played_score = played_info["score"].pov(before.turn)
-            best_cp = best_score.score(mate_score=100_000)
-            played_cp = played_score.score(mate_score=100_000)
-            if best_cp is None or played_cp is None:
-                raise RuntimeError("Stockfish không trả về điểm đánh giá.")
-            loss = max(0, best_cp - played_cp)
-            best_pv = best_info.get("pv", []) if full else []
-            exact_best = bool(best_pv and best_pv[0] == played_move)
-            result["grade"] = grade(loss, exact_best, full)
-            result["detail"] = (
-                "Thế chiếu hết" if best_score.is_mate() or played_score.is_mate()
-                else f"Độ lệch: {loss} cp"
-            )
-            result["score"] = played_info["score"].pov(chess.WHITE)
-            if best_pv:
-                result["best_prior"] = before.san(best_pv[0])
-        elif not current.is_game_over():
-            current_info = engine.analyse(current, limit, info=chess.engine.INFO_SCORE)
-            result["score"] = current_info["score"].pov(chess.WHITE)
-
-        if full and not current.is_game_over():
-            lines = engine.analyse(
-                current, limit, multipv=min(3, current.legal_moves.count()),
-                info=chess.engine.INFO_SCORE | chess.engine.INFO_PV,
-            )
-            for item in lines:
-                pv = item.get("pv", [])
-                if pv:
-                    result["lines"].append((
-                        score_text(item["score"].pov(chess.WHITE)),
-                        variation_text(current, pv),
-                    ))
-            if lines:
-                result["score"] = lines[0]["score"].pov(chess.WHITE)
-    return result
-
-
 def game_phase(board: chess.Board) -> str:
     if board.fullmove_number <= 12:
         return "Khai cuộc"
@@ -173,8 +93,8 @@ def compute_stats(
                 total += 1
             count_board.push(move)
     rows: list[dict] = []
-    with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
-        engine.configure({"Threads": 1, "Hash": 64})
+    with open_engine(engine_path) as engine:
+        configure_engine(engine, False)
         for game in matching:
             board = game.board()
             for move in game.mainline_moves():
@@ -182,22 +102,13 @@ def compute_stats(
                     return {"cancelled": True}
                 side = "White" if board.turn == chess.WHITE else "Black"
                 if game.headers.get(side, "").casefold() == player.casefold():
-                    limit = chess.engine.Limit(time=seconds)
-                    best = engine.analyse(board, limit, info=chess.engine.INFO_SCORE | chess.engine.INFO_PV)
-                    played = engine.analyse(board, limit, info=chess.engine.INFO_SCORE, root_moves=[move])
-                    best_score = best["score"].pov(board.turn)
-                    played_score = played["score"].pov(board.turn)
-                    best_cp = best_score.score(mate_score=100_000)
-                    played_cp = played_score.score(mate_score=100_000)
-                    if best_cp is None or played_cp is None:
-                        raise RuntimeError("Stockfish không trả về điểm đánh giá.")
-                    loss = max(0, best_cp - played_cp)
-                    exact = bool(best.get("pv") and best["pv"][0] == move)
+                    assessment = assess_move(engine, board, move, seconds)
                     rows.append({
                         "phase": game_phase(board), "color": "Trắng" if board.turn else "Đen",
-                        "grade": grade(loss, exact, True),
-                        "loss": min(loss, 1000),
-                        "mate": best_score.is_mate() or played_score.is_mate(),
+                        "grade": assessment["category"],
+                        "loss": min(assessment["cp_loss"], 1000),
+                        "ep_loss": assessment["ep_loss"],
+                        "mate": assessment["mate"],
                     })
                     progress.put((generation, "progress", len(rows), total))
                 board.push(move)
@@ -210,16 +121,20 @@ def format_stats(stats: dict) -> str:
         return "Không có nước đi nào để thống kê."
     counts = Counter(row["grade"] for row in rows)
     average = sum(row["loss"] for row in rows) / len(rows)
-    good = sum(counts[name] for name in ("Tốt nhất (Best Move)", "Rất tốt", "Tốt"))
+    average_ep = sum(row["ep_loss"] for row in rows) / len(rows)
+    good = sum(counts[name] for name in (
+        "brilliant", "great", "best", "excellent", "good", "book", "forced"
+    ))
     lines = [
         f"THỐNG KÊ NÂNG CAO — {stats['player']}",
         f"{stats['games']} ván · {len(rows)} nước · {good / len(rows):.0%} nước tốt",
+        f"Mất điểm kỳ vọng trung bình: {average_ep * 100:.1f}%",
         f"Độ lệch trung bình: {average:.0f} cp",
         "",
         "PHÂN LOẠI NƯỚC ĐI",
     ]
-    for name in ("Tốt nhất (Best Move)", "Rất tốt", "Tốt", "Chưa chính xác", "Sai lầm", "Sai lầm lớn"):
-        lines.append(f"  {name}: {counts[name]} ({counts[name] / len(rows):.0%})")
+    for code, (label, _color) in LABELS.items():
+        lines.append(f"  {label}: {counts[code]} ({counts[code] / len(rows):.0%})")
     lines.extend(["", "THEO GIAI ĐOẠN"])
     phase_groups: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
@@ -227,15 +142,15 @@ def format_stats(stats: dict) -> str:
     for name in ("Khai cuộc", "Trung cuộc", "Tàn cuộc"):
         group = phase_groups[name]
         if group:
-            avg = sum(row["loss"] for row in group) / len(group)
-            lines.append(f"  {name}: {len(group)} nước, lệch TB {avg:.0f} cp")
+            avg = sum(row["ep_loss"] for row in group) / len(group)
+            lines.append(f"  {name}: {len(group)} nước, mất {avg * 100:.1f}% điểm kỳ vọng TB")
     lines.extend(["", "THEO MÀU QUÂN"])
     for name in ("Trắng", "Đen"):
         group = [row for row in rows if row["color"] == name]
         if group:
-            avg = sum(row["loss"] for row in group) / len(group)
-            lines.append(f"  {name}: {len(group)} nước, lệch TB {avg:.0f} cp")
-    enough = [(name, sum(row["loss"] for row in group) / len(group))
+            avg = sum(row["ep_loss"] for row in group) / len(group)
+            lines.append(f"  {name}: {len(group)} nước, mất {avg * 100:.1f}% điểm kỳ vọng TB")
+    enough = [(name, sum(row["ep_loss"] for row in group) / len(group))
               for name, group in phase_groups.items() if len(group) >= 5]
     lines.extend(["", "ĐIỂM MẠNH / ĐIỂM CẦN LUYỆN"])
     if len(enough) >= 2:
@@ -243,18 +158,39 @@ def format_stats(stats: dict) -> str:
         lines.append(f"  Cần luyện thêm: {max(enough, key=lambda item: item[1])[0]}")
     else:
         lines.append("  Cần thêm ván để so sánh các giai đoạn.")
-    lines.extend(["", "Ghi chú: Phân loại là ước lượng riêng, không trùng Game Review của Chess.com.",
+    lines.extend(["", "Ghi chú: Dùng ngưỡng Expected Points của Chess.com với WDL từ Stockfish.",
+                  "Các nhãn đặc biệt vẫn là ước lượng; Chess.com còn dùng Elo và quy tắc riêng.",
                   "Khai cuộc: 12 lượt đầu; tàn cuộc: còn tối đa 12 quân trên bàn.",
                   "Các tình huống chiếu hết được giới hạn 1000 cp khi tính trung bình."])
     return "\n".join(lines)
+
+
+def compute_overview(
+    game: chess.pgn.Game, engine_path: str, progress: queue.Queue,
+    generation: int, cancel: threading.Event,
+) -> dict:
+    """Precompute the review summary and scores without blocking the window."""
+    board = game.board()
+    moves = list(game.mainline_moves())
+    assessments: list[dict] = []
+    with open_engine(engine_path) as engine:
+        configure_engine(engine, False)
+        for index, move in enumerate(moves, 1):
+            if cancel.is_set():
+                return {"cancelled": True}
+            assessment = assess_move(engine, board, move, 0.12)
+            assessments.append(assessment)
+            progress.put((generation, "move", index, len(moves), assessment))
+            board.push(move)
+    return {"assessments": assessments, "total": len(moves)}
 
 
 class ChessReviewApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Stockfish · Đánh giá nước đi")
-        self.root.geometry("1120x750")
-        self.root.minsize(980, 680)
+        self.root.geometry("1220x770")
+        self.root.minsize(1080, 680)
         self._set_style()
         piece_folder = Path(__file__).resolve().parent / "pieces"
         self.piece_images = {
@@ -263,7 +199,21 @@ class ChessReviewApp:
             if (piece_folder / f"{color}{piece}.png").is_file()
         }
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self.analysis_engine = EngineSession()
         self.stats_executor = ThreadPoolExecutor(max_workers=1)
+        self.overview_executor = ThreadPoolExecutor(max_workers=1)
+        self.sync_executor = ThreadPoolExecutor(max_workers=1)
+        self.sync_events: queue.Queue = queue.Queue()
+        self.sync_future: Future | None = None
+        self.user_acted = False
+        self.current_game_path: Path | None = None
+        self.game_paths: list[Path] = []
+        self.overview_events: queue.Queue = queue.Queue()
+        self.overview_generation = 0
+        self.overview_cancel = threading.Event()
+        self.overview_assessments: dict[int, dict] = {}
+        self.overview_counts: dict[str, Counter] = {"white": Counter(), "black": Counter()}
+        self.overview_points: list[float] = []
         self.results: queue.Queue[tuple[int, Future]] = queue.Queue()
         self.stats_events: queue.Queue = queue.Queue()
         self.stats_cancel = threading.Event()
@@ -271,16 +221,29 @@ class ChessReviewApp:
         self.stats_generation = 0
         self.future: Future | None = None
         self.generation = 0
+        self.analysis_cache: dict[tuple[int, bool], dict] = {}
+        self.score_cache: dict[int, tuple[chess.engine.Score | None, float]] = {}
         self.reviewing = False
+        self.review_stage = "manual"
         self.full = False
         self.flipped = False
         self.selected_square: int | None = None
+        self.marked_squares: set[int] = set()
+        self.arrows: set[tuple[int, int]] = set()
+        self.left_press_square: int | None = None
+        self.right_press_square: int | None = None
+        self.left_dragging = False
+        self.right_dragging = False
+        self.drag_item: int | None = None
+        self.autoplay_job: str | None = None
         self.games: list[chess.pgn.Game] = []
+        self.current_game: chess.pgn.Game | None = None
         self.manual_save_path: Path | None = None
         self.moves: list[chess.Move] = []
         self.positions: list[chess.Board] = [chess.Board()]
         self.ply = 0
         self.engine_var = tk.StringVar(value=str(APP_HOME / "engine" / "stockfish.exe"))
+        self.username_var = tk.StringVar(value="TheFallenWizard")
         self.seconds_var = tk.StringVar(value="2")
         self.status_var = tk.StringVar(value="Tự đi cả hai bên hoặc dán PGN; dữ liệu lưu trong D:\\Chess\\data.")
         self.grade_var = tk.StringVar(value="Chưa có nước đi")
@@ -292,6 +255,14 @@ class ChessReviewApp:
         self._draw_bar(None)
         self.root.after(100, self._poll_results)
         self.root.after(100, self._poll_stats)
+        self.root.after(100, self._poll_overview)
+        self.root.after(100, self._poll_sync)
+        self.root.after(400, self._sync_games_on_start)
+        self.root.after(24 * 60 * 60 * 1000, self._cleanup_tick)
+        self.root.bind("<Left>", lambda _event: self._go_to(self.ply - 1))
+        self.root.bind("<Right>", lambda _event: self._go_to(self.ply + 1))
+        self.root.bind("<Home>", lambda _event: self._go_to(0))
+        self.root.bind("<End>", lambda _event: self._go_to(len(self.moves)))
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _set_style(self) -> None:
@@ -316,6 +287,8 @@ class ChessReviewApp:
         style.configure("TLabelframe.Label", background="#211f1c", foreground="#a8d77a",
                         font=("Segoe UI", 10, "bold"))
         style.configure("TSeparator", background="#4a453e")
+        style.configure("Heart.TButton", background="#3b3833", foreground="#ef7484",
+                        font=("Segoe UI", 16, "bold"), padding=(8, 1))
 
     def _build_ui(self) -> None:
         heading = ttk.Frame(self.root, padding=(12, 10, 12, 0))
@@ -333,6 +306,10 @@ class ChessReviewApp:
         ttk.Button(top, text="Dán PGN…", command=self._paste_pgn,
                    style="Accent.TButton").pack(side="left", padx=5)
         ttk.Button(top, text="Ván mới", command=self._new_game).pack(side="left", padx=6)
+        ttk.Label(top, text="Tên:").pack(side="left", padx=(14, 2))
+        ttk.Entry(top, textvariable=self.username_var, width=17).pack(side="left")
+        ttk.Button(top, text="Đồng bộ", command=lambda: self._sync_games(auto_load=True)).pack(side="left", padx=4)
+        ttk.Button(top, text="Ván đã lưu", command=self._open_saved_games).pack(side="left")
 
         main = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         main.pack(fill="both", expand=True)
@@ -340,73 +317,281 @@ class ChessReviewApp:
         left.pack(side="left", fill="y")
         self.bar = tk.Canvas(left, width=40, height=BOARD_SIZE, highlightthickness=1,
                              highlightbackground="#645b50", bg="#252525")
-        self.bar.pack(side="left", padx=(0, 8))
+        self.bar.pack(side="left", anchor="n", padx=(0, 8))
         self.board_canvas = tk.Canvas(left, width=BOARD_SIZE, height=BOARD_SIZE,
                                       highlightthickness=1, highlightbackground="#645b50")
-        self.board_canvas.pack(side="left")
-        self.board_canvas.bind("<Button-1>", self._click_board)
+        self.board_canvas.pack(side="left", anchor="n")
+        self.board_canvas.bind("<ButtonPress-1>", self._left_press)
+        self.board_canvas.bind("<B1-Motion>", self._left_motion)
+        self.board_canvas.bind("<ButtonRelease-1>", self._left_release)
+        self.board_canvas.bind("<ButtonPress-3>", self._right_press)
+        self.board_canvas.bind("<B3-Motion>", self._right_motion)
+        self.board_canvas.bind("<ButtonRelease-3>", self._right_release)
 
         right = ttk.Frame(main, padding=(14, 0, 0, 0))
         right.pack(side="left", fill="both", expand=True)
-        ttk.Label(right, textvariable=self.game_var, font=("Segoe UI", 11, "bold"),
-                  wraplength=440).pack(anchor="w")
-        controls = ttk.Frame(right)
+        game_row = ttk.Frame(right)
+        game_row.pack(fill="x")
+        ttk.Label(game_row, textvariable=self.game_var, font=("Segoe UI", 11, "bold"),
+                  wraplength=410).pack(side="left", fill="x", expand=True)
+        self.favorite_button = ttk.Button(game_row, text="♡", width=3, style="Heart.TButton",
+                                          command=self._toggle_favorite, state="disabled")
+        self.favorite_button.pack(side="right")
+        self.analysis_panel = ttk.Frame(right)
+        self.analysis_panel.pack(fill="both", expand=True)
+        self.coach_tip_var = tk.StringVar(value="Bruno: Hãy chọn một nước, mình sẽ giúp bạn đọc vị trí.")
+        self.coach_tip_row = ttk.Frame(self.analysis_panel)
+        tip_asset = Path(__file__).resolve().parent / "pieces" / "bruno_coach.png"
+        self.coach_image_tip = tk.PhotoImage(file=str(tip_asset)).subsample(24, 24) if tip_asset.is_file() else None
+        if self.coach_image_tip:
+            ttk.Label(self.coach_tip_row, image=self.coach_image_tip).pack(side="left", padx=(0, 8))
+        ttk.Label(self.coach_tip_row, textvariable=self.coach_tip_var, wraplength=410,
+                  font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        controls = ttk.Frame(self.analysis_panel)
         controls.pack(fill="x", pady=(8, 5))
-        ttk.Button(controls, text="◀", width=5, command=lambda: self._go_to(self.ply - 1)).pack(side="left")
-        ttk.Button(controls, text="▶", width=5, command=lambda: self._go_to(self.ply + 1)).pack(side="left", padx=4)
+        ttk.Button(controls, text="|◀", width=4, command=lambda: self._go_to(0)).pack(side="left")
+        ttk.Button(controls, text="◀", width=4, command=lambda: self._go_to(self.ply - 1)).pack(side="left", padx=3)
+        self.autoplay_button = ttk.Button(controls, text="▶", width=4, command=self._toggle_autoplay)
+        self.autoplay_button.pack(side="left")
+        ttk.Button(controls, text="❯", width=4, command=lambda: self._go_to(self.ply + 1)).pack(side="left", padx=3)
+        ttk.Button(controls, text="▶|", width=4, command=lambda: self._go_to(len(self.moves))).pack(side="left")
         ttk.Button(controls, text="Lật bàn", command=self._flip).pack(side="left", padx=4)
         self.review_button = ttk.Button(controls, text="Xem lại", command=self._review_manual, state="disabled")
         self.review_button.pack(side="left", padx=4)
 
-        self.move_list = tk.Listbox(right, height=10, font=("Consolas", 10), exportselection=False,
+        self.move_list = tk.Listbox(self.analysis_panel, height=7, font=("Consolas", 10), exportselection=False,
                                     bg="#302d29", fg="#f2eee8", selectbackground="#729e42",
                                     selectforeground="#ffffff", borderwidth=0, highlightthickness=0)
         self.move_list.pack(fill="x")
         self.move_list.bind("<<ListboxSelect>>", self._select_move)
-        entry_row = ttk.Frame(right)
-        entry_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(entry_row, text="Nhập nước SAN/UCI:").pack(side="left")
-        self.move_entry = ttk.Entry(entry_row)
+        self.entry_row = ttk.Frame(self.analysis_panel)
+        self.entry_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(self.entry_row, text="Nhập nước SAN/UCI:").pack(side="left")
+        self.move_entry = ttk.Entry(self.entry_row)
         self.move_entry.pack(side="left", fill="x", expand=True, padx=5)
         self.move_entry.bind("<Return>", self._enter_move)
-        self.play_button = ttk.Button(entry_row, text="Đi", command=self._enter_move,
+        self.play_button = ttk.Button(self.entry_row, text="Đi", command=self._enter_move,
                                       style="Accent.TButton")
         self.play_button.pack(side="left")
 
-        ttk.Separator(right).pack(fill="x", pady=12)
-        ttk.Label(right, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(right, textvariable=self.grade_var, font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(5, 0))
-        ttk.Label(right, textvariable=self.detail_var).pack(anchor="w")
-        ttk.Label(right, text="Thanh đánh giá: Đen ở trên, Trắng ở dưới").pack(anchor="w", pady=(6, 0))
-        ttk.Label(right, textvariable=self.eval_var).pack(anchor="w")
+        self.analysis_separator = ttk.Separator(self.analysis_panel)
+        self.analysis_separator.pack(fill="x", pady=12)
+        ttk.Label(self.analysis_panel, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self.grade_label = ttk.Label(self.analysis_panel, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
+        self.grade_label.pack(anchor="w", pady=(5, 0))
+        ttk.Label(self.analysis_panel, textvariable=self.detail_var).pack(anchor="w")
+        ttk.Label(self.analysis_panel, text="Thanh đánh giá: Đen ở trên, Trắng ở dưới").pack(anchor="w", pady=(6, 0))
+        ttk.Label(self.analysis_panel, textvariable=self.eval_var).pack(anchor="w")
 
-        full_row = ttk.Frame(right)
+        full_row = ttk.Frame(self.analysis_panel)
         full_row.pack(fill="x", pady=(14, 5))
         self.full_button = ttk.Button(full_row, text="Bật Full công suất", command=self._toggle_full,
                                       state="disabled", style="Accent.TButton")
         self.full_button.pack(side="left")
         self.stats_button = ttk.Button(full_row, text="Thống kê nâng cao", command=self._open_stats, state="disabled")
         self.stats_button.pack(side="left", padx=(7, 0))
+        self.coach_button = ttk.Button(full_row, text="Hỏi HLV Bruno", command=self._ask_coach, state="disabled")
+        self.coach_button.pack(side="left", padx=(7, 0))
         ttk.Label(full_row, text="Giây/vị trí:").pack(side="left", padx=(10, 3))
-        ttk.Combobox(full_row, textvariable=self.seconds_var, values=("1", "2", "5", "10"),
-                     width=4, state="readonly").pack(side="left")
-        self.full_frame = ttk.LabelFrame(right, text="Phân tích sâu", padding=8)
-        self.full_text = tk.Text(self.full_frame, height=8, wrap="word", font=("Segoe UI", 10),
+        self.seconds_combo = ttk.Combobox(full_row, textvariable=self.seconds_var,
+                                          values=("1", "2", "5", "10"), width=4, state="readonly")
+        self.seconds_combo.pack(side="left")
+        self.seconds_combo.bind("<<ComboboxSelected>>", self._analysis_settings_changed)
+        self.full_frame = ttk.LabelFrame(self.analysis_panel, text="Phân tích sâu", padding=8)
+        self.full_text = tk.Text(self.full_frame, height=5, wrap="word", font=("Segoe UI", 10),
                                  state="disabled", bg="#302d29", fg="#f2eee8",
                                  borderwidth=0, highlightthickness=0)
         self.full_text.pack(fill="both", expand=True)
-        ttk.Label(right, textvariable=self.status_var, wraplength=420).pack(anchor="w", pady=(10, 0))
+        self.status_label = ttk.Label(self.analysis_panel, textvariable=self.status_var, wraplength=480)
+        self.status_label.pack(anchor="w", pady=(10, 0))
+
+        self.overview_panel = ttk.Frame(right, padding=(0, 12, 0, 0))
+        ttk.Label(self.overview_panel, text="TỔNG QUAN VÁN ĐẤU", font=("Segoe UI", 16, "bold"),
+                  foreground="#a8d77a").pack(anchor="w")
+        self.overview_intro = tk.StringVar(value="Đang chuẩn bị bản xem lại…")
+        ttk.Label(self.overview_panel, textvariable=self.overview_intro, wraplength=480).pack(anchor="w", pady=(3, 3))
+        coach_row = ttk.Frame(self.overview_panel)
+        coach_row.pack(fill="x", pady=(0, 3))
+        coach_asset = Path(__file__).resolve().parent / "pieces" / "bruno_coach.png"
+        self.coach_image = tk.PhotoImage(file=str(coach_asset)).subsample(16, 16) if coach_asset.is_file() else None
+        self.coach_image_popup = tk.PhotoImage(file=str(coach_asset)).subsample(9, 9) if coach_asset.is_file() else None
+        if self.coach_image:
+            ttk.Label(coach_row, image=self.coach_image).pack(side="left", padx=(0, 10))
+        ttk.Label(coach_row, text="Bruno · HLV cờ của bạn\nMình sẽ cùng bạn xem các thời điểm quan trọng và giải thích từng nước bằng biến thể cụ thể.",
+                  wraplength=330, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        ttk.Label(self.overview_panel, text="PHÂN LOẠI NƯỚC ĐI", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(2, 2))
+        self.overview_grid = ttk.Frame(self.overview_panel)
+        self.overview_grid.pack(fill="x")
+        self.overview_grid.columnconfigure(0, minsize=210)
+        self.overview_count_vars: dict[tuple[str, str], tk.StringVar] = {}
+        for col, heading in enumerate(("Nhãn", "Trắng", "Đen")):
+            ttk.Label(self.overview_grid, text=heading, font=("Segoe UI", 9, "bold"),
+                      foreground="#a8d77a").grid(row=0, column=col, sticky="w", padx=(0, 14))
+        for row, (code, (name, color)) in enumerate(LABELS.items(), 1):
+            ttk.Label(self.overview_grid, text=name, foreground=color).grid(row=row, column=0, sticky="w")
+            for col, side in ((1, "white"), (2, "black")):
+                variable = tk.StringVar(value="0")
+                self.overview_count_vars[(side, code)] = variable
+                ttk.Label(self.overview_grid, textvariable=variable).grid(row=row, column=col, sticky="w")
+        ttk.Label(self.overview_panel, text="DIỄN BIẾN LỢI THẾ", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 2))
+        self.overview_chart = tk.Canvas(self.overview_panel, height=45, bg="#302d29", highlightthickness=0)
+        self.overview_chart.pack(fill="x")
+        self.overview_start_button = ttk.Button(self.overview_panel, text="Xem lại từng nước  ▶",
+                                                 command=self._start_step_review, style="Accent.TButton")
+        self.overview_start_button.pack(fill="x", pady=(6, 0))
 
     def _choose_engine(self) -> None:
         path = filedialog.askopenfilename(title="Chọn stockfish.exe", filetypes=[("Ứng dụng", "*.exe"), ("Tất cả", "*.*")])
         if path:
             self.engine_var.set(path)
+            self._reset_analysis_cache()
+            if self.review_stage == "overview" and self.current_game is not None:
+                self._show_overview(self.current_game)
+                return
             self._request_analysis()
+
+    def _analysis_settings_changed(self, _event: tk.Event) -> None:
+        self._reset_analysis_cache()
+        if self.review_stage != "overview":
+            self._request_analysis()
+
+    def _sync_games_on_start(self) -> None:
+        try:
+            removed = prune_old_games(GAMES_DIR)
+        except (OSError, ValueError) as exc:
+            self.status_var.set(f"Không dọn được ván cũ: {exc}")
+            removed = 0
+        if removed:
+            self.status_var.set(f"Đã dọn {removed} PGN quá 30 ngày không yêu thích.")
+        self._sync_games(auto_load=True)
+
+    def _cleanup_tick(self) -> None:
+        try:
+            removed = prune_old_games(GAMES_DIR)
+            if removed:
+                self.status_var.set(f"Đã dọn {removed} PGN quá 30 ngày không yêu thích.")
+                self._update_favorite_button()
+        except (OSError, ValueError) as exc:
+            self.status_var.set(f"Không dọn được ván cũ: {exc}")
+        self.root.after(24 * 60 * 60 * 1000, self._cleanup_tick)
+
+    def _sync_games(self, auto_load: bool = False) -> None:
+        if self.sync_future is not None and not self.sync_future.done():
+            self.status_var.set("Đang đồng bộ ván đã kết thúc…")
+            return
+        username = self.username_var.get().strip()
+        self.status_var.set(f"Đang lấy các ván đã kết thúc của {username} qua API công khai…")
+        self.sync_future = self.sync_executor.submit(sync_recent_games, username, GAMES_DIR)
+        self.sync_future.add_done_callback(
+            lambda future: self.sync_events.put((future, auto_load, username))
+        )
+
+    def _poll_sync(self) -> None:
+        try:
+            while True:
+                future, auto_load, username = self.sync_events.get_nowait()
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    self.status_var.set(f"Đồng bộ không thành công: {exc}")
+                    result = None
+                if result is not None:
+                    self.status_var.set(
+                        f"Đã đồng bộ {result['total']} ván gần đây của {username}; "
+                        f"thêm {result['created']} ván vào D:\\Chess\\data\\games."
+                    )
+                if auto_load and not self.user_acted and self.current_game_path is None:
+                    latest = result["latest"] if result else None
+                    if latest is None:
+                        stored = sorted(GAMES_DIR.glob(f"chesscom-*-{username.casefold()}-*.pgn"))
+                        latest = stored[-1] if stored else None
+                    if latest is not None and latest.is_file():
+                        try:
+                            games = self._parse_pgn(latest.read_text(encoding="utf-8-sig"))
+                            self._load_pgn_games(games, latest)
+                        except (OSError, ValueError) as exc:
+                            self.status_var.set(f"Không mở được PGN đã đồng bộ: {exc}")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_sync)
+
+    def _open_saved_games(self) -> None:
+        self.user_acted = True
+        favorites = load_favorites(GAMES_DIR)
+        all_paths = sorted(GAMES_DIR.glob("*.pgn"), key=lambda path: path.stat().st_mtime,
+                           reverse=True)
+        paths = ([path for path in all_paths if path.name in favorites]
+                 + [path for path in all_paths if path.name not in favorites][:100])
+        popup = tk.Toplevel(self.root)
+        popup.title("Các ván đã lưu trên ổ D")
+        popup.configure(bg="#211f1c")
+        popup.geometry("640x490")
+        ttk.Label(popup, text=f"{len(paths)} ván gần nhất trong D:\\Chess\\data\\games",
+                  padding=10).pack(anchor="w")
+        listing = tk.Listbox(popup, bg="#302d29", fg="#f2eee8",
+                             selectbackground="#729e42", font=("Segoe UI", 10))
+        listing.pack(fill="both", expand=True, padx=10, pady=5)
+        for path in paths:
+            try:
+                with path.open("r", encoding="utf-8-sig") as source:
+                    game = chess.pgn.read_game(source)
+                title = (f"{game.headers.get('White', '?')} – {game.headers.get('Black', '?')}"
+                         if game else path.name)
+            except (OSError, UnicodeError):
+                title = path.name
+            favorite = "♥ " if path.name in favorites else ""
+            listing.insert("end", f"{favorite}{title}   ·   {path.name}")
+        if paths:
+            listing.selection_set(0)
+
+        def open_selected() -> None:
+            selection = listing.curselection()
+            if not selection:
+                return
+            path = paths[selection[0]]
+            try:
+                games = self._parse_pgn(path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError, ValueError) as exc:
+                messagebox.showerror("Không mở được ván", str(exc), parent=popup)
+                return
+            self.user_acted = True
+            popup.destroy()
+            self._load_pgn_games(games, path)
+
+        ttk.Button(popup, text="Mở ván đã chọn", command=open_selected,
+                   style="Accent.TButton").pack(fill="x", padx=10, pady=10)
+        listing.bind("<Double-Button-1>", lambda _event: open_selected())
+
+    def _update_favorite_button(self) -> None:
+        path = self.current_game_path
+        if path is None or not path.is_file():
+            self.favorite_button.configure(text="♡", state="disabled")
+            return
+        selected = path.name in load_favorites(GAMES_DIR)
+        self.favorite_button.configure(text="♥" if selected else "♡", state="normal")
+
+    def _toggle_favorite(self) -> None:
+        path = self.current_game_path
+        if path is None or not path.is_file():
+            return
+        favorites = load_favorites(GAMES_DIR)
+        if path.name in favorites:
+            favorites.remove(path.name)
+            self.status_var.set("Đã bỏ yêu thích. Ván sẽ được dọn sau khi quá 30 ngày.")
+        else:
+            favorites.add(path.name)
+            self.status_var.set("Đã yêu thích. Ván này được giữ lại trên ổ D.")
+        try:
+            save_favorites(GAMES_DIR, favorites)
+        except OSError as exc:
+            messagebox.showerror("Không lưu được yêu thích", str(exc))
+        self._update_favorite_button()
 
     def _open_pgn(self) -> None:
         path = filedialog.askopenfilename(title="Mở ván cờ PGN", filetypes=[("PGN", "*.pgn"), ("Tất cả", "*.*")])
         if not path:
             return
+        self.user_acted = True
         try:
             content = Path(path).read_text(encoding="utf-8-sig")
             games = self._parse_pgn(content)
@@ -415,7 +600,7 @@ class ChessReviewApp:
         except (OSError, UnicodeError, ValueError) as exc:
             messagebox.showerror("Không mở được PGN", str(exc))
             return
-        self._load_pgn_games(games, stored.name)
+        self._load_pgn_games(games, stored)
 
     @staticmethod
     def _parse_pgn(content: str) -> list[chess.pgn.Game]:
@@ -430,6 +615,7 @@ class ChessReviewApp:
         return games
 
     def _paste_pgn(self) -> None:
+        self.user_acted = True
         popup = tk.Toplevel(self.root)
         popup.configure(bg="#211f1c")
         popup.title("Dán mã PGN")
@@ -453,14 +639,28 @@ class ChessReviewApp:
                 messagebox.showerror("Không lưu được", str(exc), parent=popup)
                 return
             popup.destroy()
-            self._load_pgn_games(games, stored.name)
+            self.user_acted = True
+            self._load_pgn_games(games, stored)
 
         ttk.Button(popup, text="Lưu vào D:\\Chess và mở", command=save_and_open).pack(pady=10)
 
-    def _load_pgn_games(self, games: list[chess.pgn.Game], source_name: str) -> None:
+    def _load_pgn_games(self, games: list[chess.pgn.Game], source: Path) -> None:
         self.games = games
+        self.game_paths = []
+        if len(games) == 1:
+            self.game_paths.append(source)
+        else:
+            for index, game in enumerate(games):
+                digest = hashlib.sha256(
+                    f"{source.name}:{index}:{game}".encode("utf-8")
+                ).hexdigest()[:16]
+                single_path = GAMES_DIR / f"tach-van-{digest}.pgn"
+                if not single_path.is_file():
+                    single_path.write_text(str(game) + "\n", encoding="utf-8")
+                self.game_paths.append(single_path)
+        self.current_game_path = self.game_paths[0]
         self._load_game(games[0])
-        self.status_var.set(f"Đã lưu {len(games)} ván trong D:\\Chess\\data\\games ({source_name}).")
+        self.status_var.set(f"Đã mở {len(games)} ván trong D:\\Chess\\data\\games ({source.name}).")
         if len(games) > 1:
             self._choose_game_dialog()
 
@@ -478,6 +678,7 @@ class ChessReviewApp:
         def choose() -> None:
             selection = listing.curselection()
             if selection:
+                self.current_game_path = self.game_paths[selection[0]]
                 self._load_game(self.games[selection[0]])
             popup.destroy()
 
@@ -485,43 +686,67 @@ class ChessReviewApp:
         listing.bind("<Double-Button-1>", lambda _event: choose())
 
     def _load_game(self, game: chess.pgn.Game) -> None:
+        self.current_game = game
+        self._update_favorite_button()
         self.manual_save_path = None
+        self._stop_autoplay()
+        self._reset_analysis_cache()
+        self._clear_annotations()
         self.moves = list(game.mainline_moves())
         board = game.board()
         self.positions = [board.copy(stack=True)]
         for move in self.moves:
             board.push(move)
             self.positions.append(board.copy(stack=True))
-        self.ply = len(self.moves)
+        self.ply = 0
         self.reviewing = True
+        self.review_stage = "overview"
         self.full = False
         self.full_frame.pack_forget()
+        self.move_list.configure(height=7)
         self.full_button.configure(text="Bật Full công suất", state="normal")
+        self.coach_button.configure(state="disabled")
+        self.coach_tip_row.pack_forget()
         self.stats_button.configure(state="normal")
         self.review_button.configure(state="disabled")
         self.move_entry.configure(state="disabled")
         self.play_button.configure(state="disabled")
         self.game_var.set(f"{game.headers.get('White', 'Trắng')} – {game.headers.get('Black', 'Đen')}")
         self._fill_moves()
-        self._refresh()
+        self._show_overview(game)
 
     def _new_game(self) -> None:
+        self.user_acted = True
+        self._stop_autoplay()
+        self._reset_analysis_cache()
+        self._clear_annotations()
         self.games = []
+        self.current_game = None
+        self.current_game_path = None
+        self.game_paths = []
+        self._update_favorite_button()
         self.manual_save_path = None
         self.moves = []
         self.positions = [chess.Board()]
         self.ply = 0
         self.reviewing = False
+        self.review_stage = "manual"
         self.full = False
         self.selected_square = None
         self.full_frame.pack_forget()
         self.full_button.configure(text="Bật Full công suất", state="disabled")
+        self.coach_button.configure(state="disabled")
+        self.coach_tip_row.pack_forget()
         self.stats_button.configure(state="disabled")
         self.review_button.configure(state="disabled")
         self.move_entry.configure(state="normal")
         self.play_button.configure(state="normal")
+        self.entry_row.pack(fill="x", pady=(8, 0), before=self.analysis_separator)
+        self.move_list.configure(height=7)
         self.move_list.delete(0, "end")
         self.game_var.set("Ván mới")
+        self.overview_panel.pack_forget()
+        self.analysis_panel.pack(fill="both", expand=True)
         self._refresh()
 
     def _review_manual(self) -> None:
@@ -531,13 +756,106 @@ class ChessReviewApp:
         game.headers["White"] = "Trắng"
         game.headers["Black"] = "Đen"
         self.games = [game]
+        self.current_game = game
+        self.current_game_path = self.manual_save_path
+        self.game_paths = [self.manual_save_path] if self.manual_save_path else []
+        self._update_favorite_button()
         self.reviewing = True
+        self.review_stage = "overview"
         self.full_button.configure(state="normal")
         self.stats_button.configure(state="normal")
         self.review_button.configure(state="disabled")
         self.move_entry.configure(state="disabled")
         self.play_button.configure(state="disabled")
+        self.coach_button.configure(state="disabled")
+        self._show_overview(game)
+
+    def _show_overview(self, game: chess.pgn.Game) -> None:
+        self.overview_cancel.set()
+        self.overview_cancel = threading.Event()
+        self.overview_generation += 1
+        generation = self.overview_generation
+        self.overview_assessments.clear()
+        self.overview_points.clear()
+        self.overview_counts = {"white": Counter(), "black": Counter()}
+        for variable in self.overview_count_vars.values():
+            variable.set("0")
+        self.overview_chart.delete("all")
+        self.analysis_panel.pack_forget()
+        self.overview_panel.pack(fill="both", expand=True)
+        self.overview_intro.set(f"{len(self.moves)} nước đi · Đang phân tích tổng quan trên máy…")
+        self.overview_start_button.configure(state="disabled")
+        self._render_board()
+        self._draw_bar(None)
+        try:
+            path = resolve_engine(self.engine_var.get())
+        except FileNotFoundError as exc:
+            self.overview_intro.set(f"{len(self.moves)} nước đi · {exc}")
+            self.overview_start_button.configure(state="normal")
+            return
+        future = self.overview_executor.submit(
+            compute_overview, game, path, self.overview_events,
+            generation, self.overview_cancel,
+        )
+        future.add_done_callback(lambda done: self.overview_events.put((generation, "done", done)))
+
+    def _start_step_review(self) -> None:
+        self.review_stage = "step"
+        self.overview_panel.pack_forget()
+        self.analysis_panel.pack(fill="both", expand=True)
+        self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
+        self.entry_row.pack_forget()
+        self.coach_button.configure(state="normal")
+        self.ply = 0
         self._refresh()
+
+    def _poll_overview(self) -> None:
+        try:
+            while True:
+                event = self.overview_events.get_nowait()
+                generation, kind = event[:2]
+                if generation != self.overview_generation:
+                    continue
+                if kind == "move":
+                    _, _, index, total, assessment = event
+                    self.overview_assessments[index] = assessment
+                    side = "white" if index % 2 else "black"
+                    code = assessment["category"]
+                    self.overview_counts[side][code] += 1
+                    self.overview_count_vars[(side, code)].set(str(self.overview_counts[side][code]))
+                    self.overview_points.append(assessment["white_ep"])
+                    self.score_cache[index] = (assessment["white_score"], assessment["white_ep"])
+                    self.overview_intro.set(f"Đã phân tích {index}/{total} nước · Đang chuẩn bị thanh đánh giá và thống kê.")
+                    if self.review_stage == "step" and self.ply == index:
+                        self._draw_bar(*self.score_cache[index])
+                    self._draw_overview_chart()
+                else:
+                    try:
+                        event[2].result()
+                    except Exception as exc:
+                        self.overview_intro.set(f"Phân tích tổng quan dừng: {exc}. Vẫn có thể xem lại từng nước.")
+                    else:
+                        self.overview_intro.set(f"Đã phân tích {len(self.moves)} nước. Bấm Xem lại từng nước để khám phá.")
+                    self.overview_start_button.configure(state="normal")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_overview)
+
+    def _draw_overview_chart(self) -> None:
+        canvas = self.overview_chart
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 410)
+        height = 45
+        canvas.create_line(0, height / 2, width, height / 2, fill="#77716a", dash=(3, 3))
+        if not self.overview_points:
+            return
+        coordinates = [(i * width / max(len(self.moves), 1), height * (1 - ep))
+                       for i, ep in enumerate([0.5] + self.overview_points)]
+        if len(coordinates) >= 2:
+            canvas.create_line(*[coord for point in coordinates for coord in point],
+                               fill="#a8d77a", width=2, smooth=False)
+        for x, y in coordinates[1:]:
+            canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#f0d9b5", outline="")
 
     def _fill_moves(self) -> None:
         self.move_list.delete(0, "end")
@@ -553,39 +871,218 @@ class ChessReviewApp:
         if selection and self.ply != selection[0] + 1:
             self._go_to(selection[0] + 1)
 
-    def _go_to(self, ply: int) -> None:
-        if not self.reviewing:
+    def _go_to(self, ply: int, *, from_autoplay: bool = False) -> None:
+        if not self.reviewing or self.review_stage != "step":
             return
-        self.ply = max(0, min(ply, len(self.moves)))
+        if not from_autoplay:
+            self._stop_autoplay()
+        next_ply = max(0, min(ply, len(self.moves)))
+        if next_ply == self.ply:
+            return
+        self.ply = next_ply
+        self._clear_annotations()
         self._refresh()
+
+    def _toggle_autoplay(self) -> None:
+        if not self.reviewing or self.review_stage != "step":
+            return
+        if self.autoplay_job is not None:
+            self._stop_autoplay()
+            return
+        if self.ply >= len(self.moves):
+            self._go_to(0)
+        self.autoplay_button.configure(text="Ⅱ")
+        self.autoplay_job = self.root.after(700, self._autoplay_tick)
+
+    def _autoplay_tick(self) -> None:
+        self.autoplay_job = None
+        if not self.reviewing or self.ply >= len(self.moves):
+            self._stop_autoplay()
+            return
+        self._go_to(self.ply + 1, from_autoplay=True)
+        if self.ply < len(self.moves):
+            self.autoplay_job = self.root.after(700, self._autoplay_tick)
+        else:
+            self._stop_autoplay()
+
+    def _stop_autoplay(self) -> None:
+        if self.autoplay_job is not None:
+            self.root.after_cancel(self.autoplay_job)
+            self.autoplay_job = None
+        if hasattr(self, "autoplay_button"):
+            self.autoplay_button.configure(text="▶")
+
+    def _clear_annotations(self) -> None:
+        self.marked_squares.clear()
+        self.arrows.clear()
+        self.selected_square = None
+        self.left_press_square = None
+        self.right_press_square = None
+        self.left_dragging = False
+        self.right_dragging = False
+        self.drag_item = None
+
+    def _reset_analysis_cache(self) -> None:
+        self.generation += 1
+        if self.future is not None:
+            self.future.cancel()
+        self.analysis_cache.clear()
+        self.score_cache.clear()
 
     def _flip(self) -> None:
         self.flipped = not self.flipped
         self._render_board()
 
-    def _click_board(self, event: tk.Event) -> None:
-        if self.reviewing or self.positions[-1].is_game_over():
-            return
+    def _event_square(self, event: tk.Event) -> int | None:
         file_index = event.x // SQUARE
         rank_index = event.y // SQUARE
         if not 0 <= file_index < 8 or not 0 <= rank_index < 8:
-            return
+            return None
         file_ = 7 - file_index if self.flipped else file_index
         rank_ = rank_index if self.flipped else 7 - rank_index
-        square = chess.square(file_, rank_)
+        return chess.square(file_, rank_)
+
+    def _square_center(self, square: int) -> tuple[float, float]:
+        file_ = chess.square_file(square)
+        rank_ = chess.square_rank(square)
+        col = 7 - file_ if self.flipped else file_
+        row = rank_ if self.flipped else 7 - rank_
+        return (col + 0.5) * SQUARE, (row + 0.5) * SQUARE
+
+    def _legal_move(self, start: int, end: int) -> chess.Move | None:
         board = self.positions[-1]
+        piece = board.piece_at(start)
+        if piece is None or piece.color != board.turn:
+            return None
+        move = chess.Move(start, end)
+        if piece.piece_type == chess.PAWN and chess.square_rank(end) in (0, 7):
+            move = chess.Move(start, end, promotion=chess.QUEEN)
+        return move if move in board.legal_moves else None
+
+    def _left_press(self, event: tk.Event) -> None:
+        self.left_press_square = self._event_square(event)
+        self.left_press_xy = (event.x, event.y)
+        self.left_dragging = False
+
+    def _left_motion(self, event: tk.Event) -> None:
+        start = self.left_press_square
+        if start is None or self.reviewing or self.positions[-1].is_game_over():
+            return
+        piece = self.positions[-1].piece_at(start)
+        if piece is None or piece.color != self.positions[-1].turn:
+            return
+        if not self.left_dragging:
+            x0, y0 = self.left_press_xy
+            if (event.x - x0) ** 2 + (event.y - y0) ** 2 < 64:
+                return
+            self.left_dragging = True
+            self.board_canvas.itemconfigure(f"piece_{start}", state="hidden")
+            icon = self.piece_images.get(("w" if piece.color else "b", piece.symbol().upper()))
+            if icon:
+                self.drag_item = self.board_canvas.create_image(event.x, event.y, image=icon)
+            else:
+                self.drag_item = self.board_canvas.create_text(
+                    event.x, event.y, text=PIECES[piece.symbol()], font=("Segoe UI Symbol", 38)
+                )
+        elif self.drag_item is not None:
+            self.board_canvas.coords(self.drag_item, event.x, event.y)
+
+    def _left_release(self, event: tk.Event) -> None:
+        start = self.left_press_square
+        target = self._event_square(event)
+        dragging = self.left_dragging
+        self.left_press_square = None
+        self.left_dragging = False
+        if self.drag_item is not None:
+            self.board_canvas.delete(self.drag_item)
+            self.drag_item = None
+        if target is None:
+            self._render_board()
+            return
+        if dragging and start is not None:
+            move = None if self.reviewing else self._legal_move(start, target)
+            if move is not None:
+                self._play_move(move)
+            else:
+                self.selected_square = start if not self.reviewing else None
+                self._render_board()
+            return
+        if self.reviewing:
+            self._remove_annotations_at(target)
+            self._render_board()
+            return
         if self.selected_square is not None:
-            move = chess.Move(self.selected_square, square)
-            if board.piece_at(self.selected_square) and board.piece_at(self.selected_square).piece_type == chess.PAWN:
-                if chess.square_rank(square) in (0, 7):
-                    move = chess.Move(self.selected_square, square, promotion=chess.QUEEN)
-            if move in board.legal_moves:
+            if self.selected_square == target:
                 self.selected_square = None
+                self._render_board()
+                return
+            move = self._legal_move(self.selected_square, target)
+            if move is not None:
                 self._play_move(move)
                 return
-        piece = board.piece_at(square)
-        self.selected_square = square if piece and piece.color == board.turn else None
+        if target in self.marked_squares or any(target in arrow for arrow in self.arrows):
+            self._remove_annotations_at(target)
+            self._render_board()
+            return
+        board = self.positions[-1]
+        piece = board.piece_at(target)
+        self.selected_square = target if piece and piece.color == board.turn else None
         self._render_board()
+
+    def _remove_annotations_at(self, square: int) -> None:
+        self.marked_squares.discard(square)
+        self.arrows = {arrow for arrow in self.arrows if square not in arrow}
+
+    def _right_press(self, event: tk.Event) -> None:
+        self.right_press_square = self._event_square(event)
+        self.right_press_xy = (event.x, event.y)
+        self.right_dragging = False
+
+    def _right_motion(self, event: tk.Event) -> None:
+        start = self.right_press_square
+        if start is None:
+            return
+        if not self.right_dragging:
+            x0, y0 = self.right_press_xy
+            if (event.x - x0) ** 2 + (event.y - y0) ** 2 < 64:
+                return
+            self.right_dragging = True
+        self.board_canvas.delete("preview_arrow")
+        end = self._event_square(event)
+        if end is not None and end != start:
+            self._draw_arrow(start, end, "preview_arrow")
+
+    def _right_release(self, event: tk.Event) -> None:
+        start = self.right_press_square
+        end = self._event_square(event)
+        dragging = self.right_dragging
+        self.right_press_square = None
+        self.right_dragging = False
+        self.board_canvas.delete("preview_arrow")
+        if start is None:
+            return
+        if dragging and end is not None and end != start:
+            arrow = (start, end)
+            if arrow in self.arrows:
+                self.arrows.remove(arrow)
+            else:
+                self.arrows.add(arrow)
+        else:
+            if start in self.marked_squares:
+                self.marked_squares.remove(start)
+            elif any(start in arrow for arrow in self.arrows):
+                self.arrows = {arrow for arrow in self.arrows if start not in arrow}
+            else:
+                self.marked_squares.add(start)
+        self._render_board()
+
+    def _draw_arrow(self, start: int, end: int, tag: str) -> None:
+        x1, y1 = self._square_center(start)
+        x2, y2 = self._square_center(end)
+        self.board_canvas.create_line(
+            x1, y1, x2, y2, fill="#efae22", width=10,
+            arrow=tk.LAST, arrowshape=(18, 22, 8), tags=tag,
+        )
 
     def _enter_move(self, _event: tk.Event | None = None) -> None:
         if self.reviewing:
@@ -608,11 +1105,13 @@ class ChessReviewApp:
         self._play_move(move)
 
     def _play_move(self, move: chess.Move) -> None:
+        self.user_acted = True
         board = self.positions[-1].copy(stack=True)
         self.moves.append(move)
         board.push(move)
         self.positions.append(board)
         self.ply = len(self.moves)
+        self._clear_annotations()
         self._fill_moves()
         try:
             GAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -622,6 +1121,8 @@ class ChessReviewApp:
             saved_game.headers["White"] = "Trắng"
             saved_game.headers["Black"] = "Đen"
             self.manual_save_path.write_text(str(saved_game) + "\n", encoding="utf-8")
+            self.current_game_path = self.manual_save_path
+            self._update_favorite_button()
         except OSError as exc:
             messagebox.showerror("Không lưu được ván", str(exc))
         if board.is_game_over():
@@ -635,9 +1136,14 @@ class ChessReviewApp:
         self.full = not self.full
         self.full_button.configure(text="Tắt Full công suất" if self.full else "Bật Full công suất")
         if self.full:
-            self.full_frame.pack(fill="both", expand=True, pady=(0, 5))
+            self.coach_tip_row.pack_forget()
+            self.move_list.configure(height=5)
+            self.full_frame.pack(fill="both", expand=True, pady=(0, 5), before=self.status_label)
         else:
             self.full_frame.pack_forget()
+            self.move_list.configure(height=7)
+            if self.review_stage == "step":
+                self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
         self._request_analysis()
 
     def _open_stats(self) -> None:
@@ -753,9 +1259,25 @@ class ChessReviewApp:
         if self.ply:
             self.move_list.selection_set(self.ply - 1)
             self.move_list.see(self.ply - 1)
-        self.grade_var.set("Đang phân tích…" if self.ply else "Vị trí ban đầu")
-        self.detail_var.set("")
-        self._draw_bar(None)
+        cached = self.analysis_cache.get((self.ply, self.full))
+        overview = self.overview_assessments.get(self.ply) if self.reviewing else None
+        if self.review_stage == "step":
+            if self.ply:
+                san = self.positions[self.ply - 1].san(self.moves[self.ply - 1])
+                self.coach_tip_var.set(f"Bruno: {san} là thời điểm ta đang xem. Nhấn ‘Hỏi HLV Bruno’ để biết vì sao và xem biến thể thay thế.")
+            else:
+                self.coach_tip_var.set("Bruno: Bắt đầu từ thế cờ ban đầu. Dùng các nút bên dưới để đi qua từng nước.")
+        if cached:
+            self._display_analysis(cached)
+        elif overview:
+            code = overview["category"]
+            self.grade_var.set(LABELS[code][0])
+            self.grade_label.configure(foreground=LABELS[code][1])
+            self.detail_var.set(f"Mất {overview['ep_loss'] * 100:.1f}% điểm kỳ vọng")
+        else:
+            self.grade_var.set("Đang phân tích…" if self.ply else "Vị trí ban đầu")
+            self.detail_var.set("")
+        self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
         self._request_analysis()
 
     def _render_board(self) -> None:
@@ -772,36 +1294,55 @@ class ChessReviewApp:
                     color = "#cdd26a" if (file_ + rank_) % 2 else "#a6ad55"
                 if sq == self.selected_square:
                     color = "#76b7dc"
+                if sq in self.marked_squares:
+                    color = "#e36b56"
                 x, y = col * SQUARE, row * SQUARE
                 self.board_canvas.create_rectangle(x, y, x + SQUARE, y + SQUARE,
                                                    fill=color, outline=color)
+        for start, end in sorted(self.arrows):
+            self._draw_arrow(start, end, "annotation_arrow")
+        legal_targets = set()
+        if self.selected_square is not None and not self.reviewing:
+            legal_targets = {move.to_square for move in board.legal_moves
+                             if move.from_square == self.selected_square}
+        for row in range(8):
+            for col in range(8):
+                file_ = 7 - col if self.flipped else col
+                rank_ = row if self.flipped else 7 - row
+                sq = chess.square(file_, rank_)
+                x, y = col * SQUARE, row * SQUARE
                 piece = board.piece_at(sq)
                 if piece:
                     icon = self.piece_images.get(("w" if piece.color else "b", piece.symbol().upper()))
                     if icon:
-                        self.board_canvas.create_image(x + SQUARE / 2, y + SQUARE / 2, image=icon)
+                        self.board_canvas.create_image(x + SQUARE / 2, y + SQUARE / 2,
+                                                       image=icon, tags=f"piece_{sq}")
                     else:
                         self.board_canvas.create_text(x + SQUARE / 2, y + SQUARE / 2,
                                                       text=PIECES[piece.symbol()],
                                                       font=("Segoe UI Symbol", 38),
-                                                      fill="#171717" if piece.color == chess.BLACK else "#ffffff")
+                                                      fill="#171717" if piece.color == chess.BLACK else "#ffffff",
+                                                      tags=f"piece_{sq}")
+                if sq in legal_targets:
+                    if piece:
+                        self.board_canvas.create_oval(x + 5, y + 5, x + SQUARE - 5,
+                                                      y + SQUARE - 5, outline="#315a20", width=4)
+                    else:
+                        self.board_canvas.create_oval(x + 25, y + 25, x + 39, y + 39,
+                                                      fill="#6f7050", outline="")
                 if col == 0:
                     self.board_canvas.create_text(x + 4, y + 4, text=str(rank_ + 1),
                                                   anchor="nw", font=("Segoe UI", 8, "bold"),
-                                                  fill="#ffffff" if color == "#b58863" else "#333333")
+                                                  fill="#ffffff" if (file_ + rank_) % 2 == 0 else "#333333")
                 if row == 7:
                     self.board_canvas.create_text(x + SQUARE - 4, y + SQUARE - 3,
                                                   text=chess.FILE_NAMES[file_], anchor="se",
                                                   font=("Segoe UI", 8, "bold"),
-                                                  fill="#ffffff" if color == "#b58863" else "#333333")
+                                                  fill="#ffffff" if (file_ + rank_) % 2 == 0 else "#333333")
 
-    def _draw_bar(self, score: chess.engine.Score | None) -> None:
+    def _draw_bar(self, score: chess.engine.Score | None, white_ep: float = 0.5) -> None:
         self.bar.delete("all")
-        cp = score.score(mate_score=100_000) if score else 0
-        if cp is None:
-            cp = 0
-        ratio = 1 / (1 + math.exp(-max(-1500, min(1500, cp)) / 300))
-        white_height = int(BOARD_SIZE * ratio)
+        white_height = int(BOARD_SIZE * max(0.02, min(0.98, white_ep)))
         self.bar.create_rectangle(0, 0, 40, BOARD_SIZE - white_height, fill="#252525", outline="")
         self.bar.create_rectangle(0, BOARD_SIZE - white_height, 40, BOARD_SIZE, fill="#f3f3f3", outline="")
         self.eval_var.set(score_text(score) if score else "0.00")
@@ -823,8 +1364,13 @@ class ChessReviewApp:
         previous = self.positions[self.ply - 1].copy(stack=True) if self.ply else None
         move = self.moves[self.ply - 1] if self.ply else None
         current = self.positions[self.ply].copy(stack=True)
+        if (self.ply, self.full) in self.analysis_cache:
+            self._display_analysis(self.analysis_cache[(self.ply, self.full)])
+            return
         self.status_var.set("Đang phân tích sâu…" if self.full else "Đang đánh giá nước vừa đi…")
-        self.future = self.executor.submit(analyze, path, previous, move, current, self.full, seconds)
+        self.future = self.executor.submit(
+            self.analysis_engine.run, path, previous, move, current, self.full, seconds,
+        )
         self.future.add_done_callback(lambda future: self.results.put((generation, future)))
 
     def _poll_results(self) -> None:
@@ -837,34 +1383,96 @@ class ChessReviewApp:
                     result = future.result()
                 except Exception as exc:
                     self.grade_var.set("Không phân tích được")
-                    self.status_var.set(str(exc))
+                    self.detail_var.set("Hãy kiểm tra tệp Stockfish và thử lại.")
+                    self.status_var.set(f"Stockfish gặp lỗi: {exc}")
                     continue
-                self.grade_var.set(result["grade"] or "Vị trí ban đầu")
-                self.detail_var.set(result["detail"])
-                self._draw_bar(result["score"])
-                if self.full:
-                    notes = []
-                    if self.ply and result["best_prior"]:
-                        notes.append(f"Nước mạnh nhất ở lượt vừa qua: {result['best_prior']}")
-                    if result["lines"]:
-                        notes.append("Các phương án mạnh từ vị trí hiện tại:")
-                        for index, (score, line) in enumerate(result["lines"], 1):
-                            notes.append(f"{index}. {line}  (Trắng: {score})")
-                    else:
-                        notes.append("Ván đã kết thúc; không còn nước đi tiếp.")
-                    self.full_text.configure(state="normal")
-                    self.full_text.delete("1.0", "end")
-                    self.full_text.insert("1.0", "\n".join(notes))
-                    self.full_text.configure(state="disabled")
-                self.status_var.set("Đã phân tích. Nhãn đánh giá là ước lượng, có thể khác Chess.com.")
+                self.analysis_cache[(self.ply, self.full)] = result
+                self.score_cache[self.ply] = (result["score"], result["white_ep"])
+                self._display_analysis(result)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_results)
 
+    def _display_analysis(self, result: dict) -> None:
+        category = result["category"]
+        name, color = LABELS.get(category, ("Vị trí ban đầu", "#ede9e1"))
+        self.grade_var.set(name)
+        self.grade_label.configure(foreground=color)
+        self.detail_var.set(result["detail"])
+        self._draw_bar(result["score"], result["white_ep"])
+        if self.full:
+            notes = []
+            if self.ply and result["best_prior"]:
+                notes.append(f"Nước mạnh nhất ở lượt vừa qua: {result['best_prior']}")
+            if result["lines"]:
+                notes.append("Các phương án mạnh từ vị trí hiện tại:")
+                for index, (score, line) in enumerate(result["lines"], 1):
+                    notes.append(f"{index}. {line}  (Trắng: {score})")
+            else:
+                notes.append("Ván đã kết thúc; không còn nước đi tiếp.")
+            self.full_text.configure(state="normal")
+            self.full_text.delete("1.0", "end")
+            self.full_text.insert("1.0", "\n".join(notes))
+            self.full_text.configure(state="disabled")
+        self.status_var.set("Đã phân tích. Nhãn đánh giá là ước lượng, có thể khác Chess.com.")
+
+    def _ask_coach(self) -> None:
+        if self.review_stage != "step" or self.ply == 0:
+            self.status_var.set("Chọn một nước trong danh sách rồi hỏi HLV Bruno.")
+            return
+        popup = tk.Toplevel(self.root)
+        popup.title("Hỏi HLV Bruno · giải thích nước đi")
+        popup.configure(bg="#211f1c")
+        popup.geometry("660x620")
+        header = ttk.Frame(popup, padding=12)
+        header.pack(fill="x")
+        if self.coach_image_popup:
+            ttk.Label(header, image=self.coach_image_popup).pack(side="left", padx=(0, 12))
+        ttk.Label(header, text="Bruno · HLV cờ\nHỏi về nước vừa chọn. Mình sẽ đối chiếu các biến thể Stockfish và vị trí thật trên bàn.",
+                  wraplength=470, font=("Segoe UI", 11)).pack(side="left", fill="x", expand=True)
+        question = tk.StringVar(value="Tại sao nước này được đánh giá như vậy?")
+        entry = ttk.Entry(popup, textvariable=question)
+        entry.pack(fill="x", padx=12, pady=(0, 8))
+        response = tk.Text(popup, wrap="word", font=("Segoe UI", 10),
+                           bg="#302d29", fg="#f2eee8", borderwidth=0,
+                           padx=14, pady=12)
+        response.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        chosen_ply = self.ply
+
+        def answer(attempt: int = 0) -> None:
+            if not popup.winfo_exists():
+                return
+            cached = self.analysis_cache.get((chosen_ply, self.full))
+            assessment = (cached or {}).get("assessment") or self.overview_assessments.get(chosen_ply)
+            if assessment is None and attempt < 30:
+                response.delete("1.0", "end")
+                response.insert("1.0", "Bruno đang xem lại vị trí và các biến thể…")
+                popup.after(500, lambda: answer(attempt + 1))
+                return
+            if assessment is None:
+                content = "Chưa lấy được dữ liệu từ Stockfish. Hãy kiểm tra đường dẫn engine rồi thử lại."
+            else:
+                content = explain_move(self.positions[chosen_ply - 1],
+                                       self.moves[chosen_ply - 1], assessment, question.get())
+            response.delete("1.0", "end")
+            response.insert("1.0", content)
+
+        ttk.Button(popup, text="Giải thích cho tôi", command=answer,
+                   style="Accent.TButton").pack(fill="x", padx=12, pady=(0, 12))
+        entry.bind("<Return>", lambda _event: answer())
+        answer()
+
     def _close(self) -> None:
         self.stats_cancel.set()
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.overview_cancel.set()
+        self._stop_autoplay()
+        if self.future is not None:
+            self.future.cancel()
+        self.executor.submit(self.analysis_engine.close)
+        self.executor.shutdown(wait=False)
         self.stats_executor.shutdown(wait=False, cancel_futures=True)
+        self.overview_executor.shutdown(wait=False, cancel_futures=True)
+        self.sync_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 
