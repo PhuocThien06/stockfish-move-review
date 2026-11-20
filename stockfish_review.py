@@ -32,6 +32,7 @@ from chesscom_import import sync_recent_games
 from coach import explain_move
 from grade_badges import draw_badge, make_badge, text_color
 from local_store import load_favorites, prune_old_games, save_favorites
+from live_capture import LiveBoardTracker, WindowCaptureStream, board_crop, visible_windows
 from material import DISPLAY_ORDER, material_snapshot
 
 
@@ -263,6 +264,13 @@ class ChessReviewApp:
         self.best_arrow_cache: dict[int, chess.Move] = {}
         self.reviewing = False
         self.review_stage = "manual"
+        self.live_tracker: LiveBoardTracker | None = None
+        self.live_stream: WindowCaptureStream | None = None
+        self.live_window: int | None = None
+        self.live_region: tuple[int, int, int, int] | None = None
+        self.live_job: str | None = None
+        self.live_game_path: Path | None = None
+        self.live_window_title = ""
         self.full = False
         self.flipped = False
         self.selected_square: int | None = None
@@ -290,6 +298,7 @@ class ChessReviewApp:
         self.eval_var = tk.StringVar(value="0.00")
         self.bar_orientation_var = tk.StringVar(value="Thanh đánh giá: Đen ở trên, Trắng ở dưới")
         self.game_var = tk.StringVar(value="")
+        self.live_status_var = tk.StringVar(value="Chọn cửa sổ và vùng bàn cờ trước khi bắt đầu ván.")
         self._build_ui()
         self._render_board()
         self._draw_bar(None)
@@ -348,6 +357,13 @@ class ChessReviewApp:
         ttk.Entry(top, textvariable=self.username_var, width=17).pack(side="left")
         ttk.Button(top, text="Đồng bộ", command=lambda: self._sync_games(auto_load=True)).pack(side="left", padx=4)
         ttk.Button(top, text="Ván đã lưu", command=self._open_saved_games).pack(side="left")
+
+        live_row = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        live_row.pack(fill="x")
+        self.live_button = ttk.Button(live_row, text="Theo dõi bàn cờ trên màn hình…",
+                                      command=self._open_live_capture)
+        self.live_button.pack(side="left")
+        ttk.Label(live_row, textvariable=self.live_status_var).pack(side="left", padx=10)
 
         main = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         main.pack(fill="both", expand=True)
@@ -515,6 +531,243 @@ class ChessReviewApp:
                 self._show_overview(self.current_game)
                 return
             self._request_analysis()
+
+    def _open_live_capture(self) -> None:
+        if self.live_tracker is not None:
+            self._stop_live_capture()
+            return
+        self.user_acted = True
+        windows = [(hwnd, title) for hwnd, title in visible_windows()
+                   if "Stockfish · Đánh giá nước đi" not in title]
+        if not windows:
+            messagebox.showerror("Không tìm thấy cửa sổ", "Hãy mở cửa sổ có bàn cờ rồi thử lại.")
+            return
+        from PIL import ImageTk
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Chọn cửa sổ và vùng bàn cờ")
+        dialog.geometry("1000x740")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Mở ván ở vị trí ban đầu, chọn cửa sổ, rồi khoanh đúng 8×8 ô bàn cờ.",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 5))
+        titles = [f"{title[:95]}  [{hwnd}]" for hwnd, title in windows]
+        selection = ttk.Combobox(dialog, values=titles, state="readonly")
+        selection.pack(fill="x", padx=12)
+        preferred = next((index for index, (_, title) in enumerate(windows)
+                          if "chess.com" in title.casefold()), 0)
+        selection.current(preferred)
+        status = tk.StringVar(value="Bấm Chụp cửa sổ, rồi kéo chuột quanh bàn cờ trong ảnh.")
+        ttk.Label(dialog, textvariable=status).pack(anchor="w", padx=12, pady=5)
+        preview = tk.Canvas(dialog, bg="#302d29", highlightthickness=0,
+                            cursor="crosshair")
+        preview.pack(fill="both", expand=True, padx=12, pady=5)
+        state: dict = {"image": None, "photo": None, "scale": 1.0,
+                       "start": None, "box": None, "rectangle": None,
+                       "stream": None, "hwnd": None}
+
+        def cancel() -> None:
+            if state["stream"] is not None:
+                state["stream"].close()
+                state["stream"] = None
+            dialog.grab_release()
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", lambda _event: cancel())
+
+        def take_preview() -> None:
+            try:
+                hwnd = windows[selection.current()][0]
+                if state["stream"] is not None and state["hwnd"] != hwnd:
+                    state["stream"].close()
+                    state["stream"] = None
+                if state["stream"] is None:
+                    state["stream"] = WindowCaptureStream(hwnd)
+                    state["hwnd"] = hwnd
+                source = state["stream"].latest(timeout=4)
+                max_width = max(300, preview.winfo_width() - 4)
+                max_height = max(250, preview.winfo_height() - 4)
+                factor = min(max_width / source.width, max_height / source.height, 1.0)
+                display = source.resize((round(source.width * factor),
+                                         round(source.height * factor)))
+                photo = ImageTk.PhotoImage(display)
+                state.update({"image": source, "photo": photo, "scale": factor,
+                              "start": None, "box": None, "rectangle": None})
+                preview.delete("all")
+                preview.create_image(0, 0, image=photo, anchor="nw")
+                status.set("Kéo một hình vuông sát mép bàn cờ; không lấy đồng hồ hoặc danh sách nước.")
+            except Exception as exc:
+                status.set(f"Không chụp được cửa sổ này: {exc}")
+
+        def press(event: tk.Event) -> None:
+            if state["image"] is None:
+                return
+            state["start"] = (event.x, event.y)
+            if state["rectangle"] is not None:
+                preview.delete(state["rectangle"])
+            state["rectangle"] = preview.create_rectangle(
+                event.x, event.y, event.x, event.y, outline="#f8b831", width=3)
+
+        def drag(event: tk.Event) -> None:
+            if state["start"] is not None:
+                x, y = state["start"]
+                preview.coords(state["rectangle"], x, y, event.x, event.y)
+
+        def release(event: tk.Event) -> None:
+            if state["start"] is None:
+                return
+            x, y = state["start"]
+            factor = state["scale"]
+            box = (round(min(x, event.x) / factor), round(min(y, event.y) / factor),
+                   round(max(x, event.x) / factor), round(max(y, event.y) / factor))
+            try:
+                board_crop(state["image"], box)
+            except ValueError as exc:
+                state["box"] = None
+                status.set(str(exc))
+                return
+            state["box"] = box
+            status.set("Đã chọn bàn cờ. Để cửa sổ này mở ở vị trí ban đầu rồi bấm Bắt đầu.")
+
+        preview.bind("<ButtonPress-1>", press)
+        preview.bind("<B1-Motion>", drag)
+        preview.bind("<ButtonRelease-1>", release)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=12, pady=(2, 10))
+        ttk.Button(buttons, text="Chụp cửa sổ", command=take_preview).pack(side="left")
+        flipped = tk.BooleanVar(value=self.flipped)
+        ttk.Checkbutton(buttons, text="Đen ở dưới", variable=flipped).pack(side="left", padx=12)
+
+        def begin() -> None:
+            box = state["box"]
+            if box is None:
+                status.set("Hãy chụp và chọn vùng bàn cờ trước.")
+                return
+            hwnd, title = windows[selection.current()]
+            try:
+                stream = state["stream"]
+                if stream is None or state["hwnd"] != hwnd:
+                    raise ValueError("Hãy chụp lại cửa sổ đã chọn.")
+                first_frame = board_crop(stream.latest(timeout=4), box)
+            except (OSError, ValueError, TimeoutError) as exc:
+                status.set(f"Không đọc được bàn cờ: {exc}")
+                return
+            state["stream"] = None
+            dialog.grab_release()
+            dialog.destroy()
+            self._begin_live_capture(hwnd, title, box, flipped.get(), first_frame, stream)
+
+        ttk.Button(buttons, text="Bắt đầu theo dõi", command=begin,
+                   style="Accent.TButton").pack(side="right")
+        dialog.after(150, take_preview)
+
+    def _begin_live_capture(self, hwnd: int, title: str,
+                            box: tuple[int, int, int, int], flipped: bool,
+                            first_frame, stream: WindowCaptureStream) -> None:
+        self._new_game()
+        self.flipped = flipped
+        self.live_tracker = LiveBoardTracker(chess.Board(), flipped)
+        self.live_tracker.observe(first_frame)
+        self.live_stream = stream
+        self.live_window = hwnd
+        self.live_region = box
+        self.live_window_title = title
+        self.live_game_path = GAMES_DIR / local_filename("van-theo-doi", ".pgn")
+        self.manual_save_path = self.live_game_path
+        self.move_entry.configure(state="disabled")
+        self.play_button.configure(state="disabled")
+        self.live_button.configure(text="Dừng theo dõi")
+        self.game_var.set("Đang theo dõi · " + title[:65])
+        self.live_status_var.set("Đang nhận nước đi trực tiếp · 0 nước")
+        self._render_board()
+        self._draw_bar(None)
+        self.live_job = self.root.after(350, self._capture_live_tick)
+
+    def _capture_live_tick(self) -> None:
+        self.live_job = None
+        tracker = self.live_tracker
+        if (tracker is None or self.live_stream is None
+                or self.live_window is None or self.live_region is None):
+            return
+        try:
+            if self.live_stream.closed:
+                raise OSError("Cửa sổ nguồn đã đóng.")
+            frame = board_crop(self.live_stream.latest(), self.live_region)
+            move = tracker.observe(frame)
+        except (OSError, ValueError, TimeoutError) as exc:
+            self._stop_live_capture()
+            self.live_status_var.set(f"Đã dừng: {exc}")
+            return
+        if move is not None:
+            self._apply_live_move(move)
+        elif tracker.unmatched_frames >= 15:
+            saved_path = self.live_game_path
+            self._stop_live_capture()
+            self.live_status_var.set(
+                "Đã dừng vì ảnh bàn cờ đổi nhưng không nhận được nước hợp lệ. "
+                f"PGN trước đó đã lưu tại {saved_path}. Chọn lại vùng và chiều bàn để theo dõi ván mới."
+            )
+        if self.live_tracker is not None:
+            self.live_job = self.root.after(350, self._capture_live_tick)
+
+    def _apply_live_move(self, move: chess.Move) -> None:
+        current = self.positions[-1]
+        if move not in current.legal_moves:
+            self._stop_live_capture()
+            self.live_status_var.set("Vị trí trên màn hình không khớp PGN đã ghi; hãy chọn lại vùng bàn cờ.")
+            return
+        following = current.copy(stack=True)
+        following.push(move)
+        self.moves.append(move)
+        self.positions.append(following)
+        self.ply = len(self.moves)
+        self._clear_annotations()
+        game = chess.pgn.Game.from_board(following)
+        name = self.username_var.get().strip() or "Bạn"
+        game.headers["White"] = "Đối thủ" if self.live_tracker.flipped else name
+        game.headers["Black"] = name if self.live_tracker.flipped else "Đối thủ"
+        game.headers["Event"] = "Theo dõi bàn cờ trên màn hình"
+        self.current_game = game
+        try:
+            GAMES_DIR.mkdir(parents=True, exist_ok=True)
+            temporary = self.live_game_path.with_suffix(".part")
+            temporary.write_text(str(game) + "\n", encoding="utf-8")
+            temporary.replace(self.live_game_path)
+            self.current_game_path = self.live_game_path
+            self._update_favorite_button()
+        except OSError as exc:
+            self._stop_live_capture()
+            self.live_status_var.set(f"Không lưu được PGN: {exc}")
+            return
+        self._fill_moves()
+        self._refresh()
+        self.live_status_var.set(f"Đang nhận nước đi trực tiếp · {self.ply} nước · "
+                                 f"vừa ghi {self.positions[-2].san(move)}")
+        if following.is_game_over():
+            self._stop_live_capture()
+            self.live_status_var.set("Ván đã kết thúc; PGN đã lưu trên ổ D.")
+
+    def _stop_live_capture(self) -> None:
+        if self.live_job is not None:
+            self.root.after_cancel(self.live_job)
+            self.live_job = None
+        if self.live_tracker is None:
+            return
+        count = len(self.moves)
+        self.live_tracker = None
+        if self.live_stream is not None:
+            self.live_stream.close()
+            self.live_stream = None
+        self.live_window = None
+        self.live_region = None
+        self.live_button.configure(text="Theo dõi bàn cờ trên màn hình…")
+        self.move_entry.configure(state="normal")
+        self.play_button.configure(state="normal")
+        self.live_status_var.set(
+            f"Đã dừng theo dõi · {count} nước; PGN lưu tại D:\\Chess\\data\\games."
+            if count else "Đã dừng theo dõi trước khi có nước đi."
+        )
 
     def _analysis_settings_changed(self, _event: tk.Event) -> None:
         self.analysis_cache = {
@@ -754,6 +1007,7 @@ class ChessReviewApp:
         listing.bind("<Double-Button-1>", lambda _event: choose())
 
     def _load_game(self, game: chess.pgn.Game) -> None:
+        self._stop_live_capture()
         self._dismiss_coach_panel()
         self.current_game = game
         self.original_review_state = None
@@ -793,6 +1047,7 @@ class ChessReviewApp:
         self._show_overview(game)
 
     def _new_game(self) -> None:
+        self._stop_live_capture()
         self._dismiss_coach_panel()
         self.user_acted = True
         self._stop_autoplay()
@@ -957,7 +1212,8 @@ class ChessReviewApp:
         for index, move in enumerate(self.moves):
             board = self.positions[index]
             prefix = f"{board.fullmove_number}{'.' if board.turn else '...'}"
-            category = self.overview_assessments.get(index + 1, {}).get("category")
+            category = (self.overview_assessments.get(index + 1, {}).get("category")
+                        or self.analysis_cache.get((index + 1, False), {}).get("category"))
             label = f"  ·  {LABELS[category][0]}" if category in LABELS else ""
             self.move_list.insert("end", f"{prefix} {board.san(move)}{label}")
             if category in LABELS:
@@ -975,6 +1231,8 @@ class ChessReviewApp:
             self._go_to(selection[0] + 1)
 
     def _go_to(self, ply: int, *, from_autoplay: bool = False) -> None:
+        if self.live_tracker is not None:
+            return
         if self.reviewing and self.review_stage != "step":
             return
         if not from_autoplay:
@@ -1062,7 +1320,7 @@ class ChessReviewApp:
         return (col + 0.5) * SQUARE, (row + 0.5) * SQUARE
 
     def _can_move_board(self) -> bool:
-        return not self.reviewing or self.review_stage == "step"
+        return self.live_tracker is None and (not self.reviewing or self.review_stage == "step")
 
     def _legal_move(self, start: int, end: int) -> chess.Move | None:
         if not self._can_move_board():
@@ -1226,6 +1484,8 @@ class ChessReviewApp:
         self._play_move(move)
 
     def _play_move(self, move: chess.Move) -> None:
+        if self.live_tracker is not None:
+            return
         self.user_acted = True
         if self.reviewing:
             if self.review_stage == "step":
@@ -1759,6 +2019,8 @@ class ChessReviewApp:
                 self.analysis_cache[(self.ply, self.full)] = result
                 self.score_cache[self.ply] = (result["score"], result["white_ep"])
                 self._display_analysis(result)
+                if self.live_tracker is not None:
+                    self._fill_moves()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_results)
@@ -2047,6 +2309,7 @@ class ChessReviewApp:
         self.coach_close = close_panel
 
     def _close(self) -> None:
+        self._stop_live_capture()
         self._dismiss_coach_panel()
         self.stats_cancel.set()
         self.overview_cancel.set()

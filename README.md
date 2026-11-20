@@ -2,7 +2,7 @@
 
 Ứng dụng Python chạy trên Windows để tự đi cả hai bên, đánh giá nước vừa đi và xem lại những ván đã kết thúc. Mã nguồn, Stockfish, môi trường Python, PGN và báo cáo đều nằm trong `D:\Chess`.
 
-Đây là ứng dụng độc lập, không liên kết hay được Chess.com bảo trợ. Ứng dụng chỉ dùng [PubAPI công khai](https://support.chess.com/en/articles/9650547-what-is-the-pubapi-and-how-do-i-use-it) để đồng bộ các ván đã kết thúc; không đăng nhập, đọc ván đang diễn ra hay điều khiển bàn cờ trên trang web.
+Đây là ứng dụng độc lập, không liên kết hay được Chess.com bảo trợ. Ứng dụng dùng [PubAPI công khai](https://support.chess.com/en/articles/9650547-what-is-the-pubapi-and-how-do-i-use-it) để đồng bộ các ván đã kết thúc. Chế độ theo dõi tùy chọn chụp cửa sổ bằng Windows để nhận nước đi đang hiển thị; ứng dụng không đăng nhập, đọc mã trang hay điều khiển bàn cờ trên trang web.
 
 ## Cách chạy
 
@@ -25,6 +25,8 @@
 Tên đồng bộ mặc định là **TheFallenWizard**. Khi mở ứng dụng hoặc bấm **Đồng bộ**, chương trình lấy tối đa **10 ván công khai đã kết thúc gần nhất trong 30 ngày qua**, lưu mỗi ván một lần vào `D:\Chess\data\games`, rồi mở ván mới nhất. Các ván đã lưu từ lần trước vẫn tuân theo quy tắc dọn sau 30 ngày và ngoại lệ yêu thích. Có thể sửa tên ở thanh trên cùng hoặc mở **Ván đã lưu**. Việc tải dùng các lời gọi tuần tự tới API; nếu Chess.com giới hạn truy cập, ứng dụng hiển thị lỗi và vẫn dùng được PGN trên máy. Quyền dùng API không bảo đảm tài khoản sẽ không bao giờ bị hạn chế. Theo [Fair Play của Chess.com](https://support.chess.com/en/articles/8568369-what-do-i-need-to-know-about-fair-play-on-chess-com), không dùng Stockfish để phân tích một ván trên Chess.com khi ván đó còn đang diễn ra.
 
 ## Sử dụng
+
+**Theo dõi trực tiếp:** mở ván ở vị trí ban đầu, bấm **Theo dõi bàn cờ trên màn hình…**, chọn cửa sổ và bấm **Chụp cửa sổ**. Kéo chuột khoanh sát 8×8 ô trong ảnh xem trước, chọn **Đen ở dưới** nếu cần, rồi bấm **Bắt đầu theo dõi**. Bàn cờ và đánh giá cập nhật sau từng nước được nhận. Bấm **Dừng theo dõi** để ngừng. PGN được lưu sau từng nước trên ổ D; ứng dụng không lưu video liên tục. Nếu cửa sổ đổi kích thước hoặc bàn cờ xoay, hãy chọn lại vùng. Nếu không nhận được nước hợp lệ sau khi ảnh đổi, chương trình dừng để tránh ghi PGN sai. Chức năng này chỉ chạy trên Windows và dùng Windows Graphics Capture cùng Pillow. Theo Fair Play của Chess.com, chỉ dùng đánh giá trực tiếp khi đấu với bot hoặc luyện tập riêng; ván với người thật chỉ xem lại sau khi kết thúc.
 
 - **Bàn cờ tự đi:** bấm quân rồi bấm ô đích, hoặc giữ chuột trái kéo quân và thả. Bạn đi cả Trắng lẫn Đen. Stockfish chỉ đánh giá nước vừa đi và cập nhật thanh lợi thế; không gợi ý nước tiếp theo trong chế độ này. Có thể dùng nút đầu/trước/sau/cuối, phím `Home`, `←`, `→`, `End` hoặc danh sách nước để quay lại khi đang tự đi. Nếu đi trùng nước cũ, ứng dụng tiến tới nước đó; nếu đổi nước, ứng dụng lưu đường mới thành PGN riêng và giữ PGN cũ trong **Ván đã lưu**.
 - **Đánh dấu:** bấm chuột phải lên ô để tô đỏ; giữ chuột phải kéo giữa hai ô để vẽ mũi tên vàng. Kéo chéo tạo mũi tên gấp khúc gồm hai đoạn vuông góc: đi ngang trước, rồi đi dọc đến ô đích. Có thể vẽ nhiều mũi tên. Bấm lại bằng chuột phải hoặc bấm trái vào ô/mũi tên để xóa.
