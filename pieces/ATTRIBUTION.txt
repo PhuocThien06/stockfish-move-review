@@ -1,0 +1,5 @@
+Neo chess piece images from Chess.com.
+Source pattern: https://www.chess.com/chess-themes/pieces/neo/64/{color}{piece}.png
+Rights in these images belong to Chess.com. They are bundled here for the
+user's personal, local chess review project. Check Chess.com's terms before
+redistributing them beyond a private repository.
