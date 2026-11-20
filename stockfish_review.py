@@ -199,6 +199,8 @@ class ChessReviewApp:
         self.root.title("Stockfish · Đánh giá nước đi")
         self.root.geometry("1220x770")
         self.root.minsize(1080, 680)
+        if sys.platform == "win32":
+            self.root.state("zoomed")
         self._set_style()
         piece_folder = Path(__file__).resolve().parent / "pieces"
         self.piece_images = {
@@ -402,13 +404,27 @@ class ChessReviewApp:
         self.review_button = ttk.Button(controls, text="Xem lại", command=self._review_manual, state="disabled")
         self.review_button.pack(side="left", padx=4)
 
-        self.move_list = tk.Listbox(self.analysis_panel, height=7, font=("Consolas", 10), exportselection=False,
+        self.detail_area = ttk.Frame(self.analysis_panel)
+        self.detail_area.pack(fill="both", expand=True)
+        self.review_sidebar = ttk.Frame(self.detail_area, width=330)
+        self.review_sidebar.pack(side="right", fill="y", padx=(10, 0))
+        self.review_sidebar.pack_propagate(False)
+        self.coach_idle = ttk.LabelFrame(self.detail_area, text="Bruno · HLV cờ", padding=12)
+        self.coach_idle.pack(side="left", fill="both", expand=True)
+        idle_header = ttk.Frame(self.coach_idle)
+        idle_header.pack(anchor="nw")
+        self.coach_idle_image = ttk.Label(idle_header)
+        self.coach_idle_image.pack(side="left", padx=(0, 12))
+        ttk.Label(idle_header, text="Chọn một nước để Bruno giải thích trên bàn cờ.",
+                  wraplength=320).pack(side="left")
+
+        self.move_list = tk.Listbox(self.review_sidebar, height=11, font=("Consolas", 10), exportselection=False,
                                     bg="#302d29", fg="#f2eee8", selectbackground="#729e42",
                                     selectforeground="#ffffff", borderwidth=0, highlightthickness=0)
         self.move_list.pack(fill="x")
         self.move_list.bind("<<ListboxSelect>>", self._select_move)
         self.entry_row = ttk.Frame(self.analysis_panel)
-        self.entry_row.pack(fill="x", pady=(8, 0))
+        self.entry_row.pack(fill="x", pady=(8, 0), before=self.detail_area)
         ttk.Label(self.entry_row, text="Nhập nước SAN/UCI:").pack(side="left")
         self.move_entry = ttk.Entry(self.entry_row)
         self.move_entry.pack(side="left", fill="x", expand=True, padx=5)
@@ -417,9 +433,9 @@ class ChessReviewApp:
                                       style="Accent.TButton")
         self.play_button.pack(side="left")
 
-        self.analysis_separator = ttk.Separator(self.analysis_panel)
+        self.analysis_separator = ttk.Separator(self.review_sidebar)
         self.analysis_separator.pack(fill="x", pady=12)
-        self.grade_section = ttk.Frame(self.analysis_panel)
+        self.grade_section = ttk.Frame(self.review_sidebar)
         self.grade_section.pack(fill="x")
         ttk.Label(self.grade_section, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         grade_row = ttk.Frame(self.grade_section)
@@ -433,7 +449,7 @@ class ChessReviewApp:
 
         full_row = ttk.Frame(self.analysis_panel)
         self.full_row = full_row
-        full_row.pack(fill="x", pady=(14, 5))
+        full_row.pack(fill="x", pady=(8, 5), before=self.detail_area)
         self.full_button = ttk.Button(full_row, text="Bật Full công suất", command=self._toggle_full,
                                       state="disabled", style="Accent.TButton")
         self.full_button.pack(side="left")
@@ -764,7 +780,7 @@ class ChessReviewApp:
         self.review_stage = "overview"
         self.full = False
         self.full_frame.pack_forget()
-        self.move_list.configure(height=7)
+        self.move_list.configure(height=11)
         self.full_button.configure(text="Bật Full công suất", state="normal")
         self.coach_button.configure(state="disabled")
         self.coach_tip_row.pack_forget()
@@ -808,8 +824,8 @@ class ChessReviewApp:
         self.review_button.configure(text="Xem lại", command=self._review_manual, state="disabled")
         self.move_entry.configure(state="normal")
         self.play_button.configure(state="normal")
-        self.entry_row.pack(fill="x", pady=(8, 0), before=self.analysis_separator)
-        self.move_list.configure(height=7)
+        self.entry_row.pack(fill="x", pady=(8, 0), before=self.detail_area)
+        self.move_list.configure(height=11)
         self.move_list.delete(0, "end")
         self.game_var.set("Ván mới")
         self.overview_panel.pack_forget()
@@ -875,11 +891,12 @@ class ChessReviewApp:
         self.review_stage = "step"
         self.overview_panel.pack_forget()
         self.analysis_panel.pack(fill="both", expand=True)
-        self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
+        self.coach_tip_row.pack_forget()
         self.entry_row.pack_forget()
         self.coach_button.configure(state="normal")
         self.ply = 0
         self._refresh()
+        self.coach_idle.pack(side="left", fill="both", expand=True)
 
     def _poll_overview(self) -> None:
         try:
@@ -968,6 +985,13 @@ class ChessReviewApp:
         self.ply = next_ply
         self._clear_annotations()
         self._refresh()
+        if (self.review_stage == "step" and self.ply and not from_autoplay
+                and self.coach_panel is None):
+            self.root.after_idle(
+                lambda: self._ask_coach()
+                if self.review_stage == "step" and self.ply and self.coach_panel is None
+                else None
+            )
 
     def _toggle_autoplay(self) -> None:
         if not self.reviewing or self.review_stage != "step":
@@ -1371,14 +1395,11 @@ class ChessReviewApp:
         self.full_button.configure(text="Tắt Full công suất" if self.full else "Bật Full công suất")
         if self.full:
             self.coach_tip_row.pack_forget()
-            self.move_list.configure(height=5)
-            if self.coach_panel is None:
-                self.full_frame.pack(fill="both", expand=True, pady=(0, 5), before=self.status_label)
+            self.move_list.configure(height=9)
+            self.full_frame.pack(fill="x", pady=(0, 5), before=self.detail_area)
         else:
             self.full_frame.pack_forget()
-            self.move_list.configure(height=7)
-            if self.review_stage == "step" and self.coach_panel is None:
-                self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
+            self.move_list.configure(height=11)
         self._request_analysis()
 
     def _open_stats(self) -> None:
@@ -1493,6 +1514,7 @@ class ChessReviewApp:
         images = self.coach_images.get(mood) or self.coach_images.get("neutral", {})
         if images:
             self.coach_tip_label.configure(image=images["tip"])
+            self.coach_idle_image.configure(image=images["popup"])
         neutral = self.coach_images.get("neutral")
         if neutral:
             self.coach_overview_label.configure(image=neutral["overview"])
@@ -1793,12 +1815,9 @@ class ChessReviewApp:
         self._dismiss_coach_panel()
         self._stop_autoplay()
         self.coach_tip_row.pack_forget()
-        self.move_list.pack_forget()
-        self.analysis_separator.pack_forget()
-        self.grade_section.pack_forget()
-        self.full_frame.pack_forget()
-        panel = ttk.LabelFrame(self.analysis_panel, text="Bruno · HLV cờ", padding=8)
-        panel.pack(fill="both", expand=True, before=self.status_label)
+        self.coach_idle.pack_forget()
+        panel = ttk.LabelFrame(self.detail_area, text="Bruno · HLV cờ", padding=8)
+        panel.pack(side="left", fill="both", expand=True, before=self.review_sidebar)
         self.coach_panel = panel
         header = ttk.Frame(panel)
         header.pack(fill="x")
@@ -2021,14 +2040,8 @@ class ChessReviewApp:
             if panel.winfo_exists():
                 panel.destroy()
             if self.review_stage == "step":
-                self.move_list.configure(height=5 if self.full else 7)
-                self.analysis_separator.pack(fill="x", pady=12, before=self.full_row)
-                self.grade_section.pack(fill="x", before=self.full_row)
-                self.move_list.pack(fill="x", before=self.analysis_separator)
-                if self.full:
-                    self.full_frame.pack(fill="both", expand=True, pady=(0, 5), before=self.status_label)
-                else:
-                    self.coach_tip_row.pack(fill="x", pady=(4, 3), before=self.autoplay_button.master)
+                self.coach_idle.pack(side="left", fill="both", expand=True,
+                                     before=self.review_sidebar)
 
         ttk.Button(more_buttons, text="Đóng giải thích", command=close_panel).pack(side="left", padx=6)
         self.coach_close = close_panel
