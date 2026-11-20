@@ -18,6 +18,7 @@ USER_AGENT = (
     "StockfishMoveReview/1.1 "
     "(https://github.com/PhuocThien06/stockfish-move-review; personal local PGN importer)"
 )
+SYNC_GAME_LIMIT = 10
 
 
 def _get_json(url: str) -> dict:
@@ -66,8 +67,8 @@ def fetch_recent_games(username: str, limit: int | None = None) -> list[dict]:
 
 
 def sync_recent_games(username: str, directory: Path) -> dict:
-    """Save each recent completed PGN once under D:/Chess/data/games."""
-    games = fetch_recent_games(username)
+    """Save at most ten recent completed PGNs under D:/Chess/data/games."""
+    games = fetch_recent_games(username, limit=SYNC_GAME_LIMIT)
     directory.mkdir(parents=True, exist_ok=True)
     newest: Path | None = None
     created = 0

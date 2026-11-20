@@ -504,7 +504,7 @@ class ChessReviewApp:
             self.status_var.set("Đang đồng bộ ván đã kết thúc…")
             return
         username = self.username_var.get().strip()
-        self.status_var.set(f"Đang lấy các ván đã kết thúc của {username} qua API công khai…")
+        self.status_var.set(f"Đang lấy tối đa 10 ván đã kết thúc gần nhất của {username}…")
         self.sync_future = self.sync_executor.submit(sync_recent_games, username, GAMES_DIR)
         self.sync_future.add_done_callback(
             lambda future: self.sync_events.put((future, auto_load, username))
@@ -521,7 +521,7 @@ class ChessReviewApp:
                     result = None
                 if result is not None:
                     self.status_var.set(
-                        f"Đã đồng bộ {result['total']} ván gần đây của {username}; "
+                        f"Đã đồng bộ {result['total']} ván gần nhất của {username} (tối đa 10); "
                         f"thêm {result['created']} ván vào D:\\Chess\\data\\games."
                     )
                 if auto_load and not self.user_acted and self.current_game_path is None:
@@ -1126,8 +1126,12 @@ class ChessReviewApp:
     def _draw_arrow(self, start: int, end: int, tag: str) -> None:
         x1, y1 = self._square_center(start)
         x2, y2 = self._square_center(end)
+        if tag in ("annotation_arrow", "preview_arrow") and x1 != x2 and y1 != y2:
+            points = (x1, y1, x2, y1, x2, y2)
+        else:
+            points = (x1, y1, x2, y2)
         self.board_canvas.create_line(
-            x1, y1, x2, y2, fill="#efae22", width=14,
+            *points, fill="#efae22", width=14, joinstyle=tk.ROUND,
             arrow=tk.LAST, arrowshape=(24, 32, 12), tags=tag,
         )
 
