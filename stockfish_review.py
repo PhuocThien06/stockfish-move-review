@@ -32,7 +32,8 @@ from chesscom_import import sync_recent_games
 from coach import explain_move
 from grade_badges import draw_badge, make_badge, text_color
 from local_store import load_favorites, prune_old_games, save_favorites
-from live_capture import LiveBoardTracker, WindowCaptureStream, board_crop, visible_windows
+from live_capture import (LiveBoardTracker, WindowCaptureStream, board_crop,
+                          recognize_board, visible_windows)
 from material import DISPLAY_ORDER, material_snapshot
 
 
@@ -261,6 +262,10 @@ class ChessReviewApp:
         self.generation = 0
         self.analysis_cache: dict[tuple[int, bool], dict] = {}
         self.score_cache: dict[int, tuple[chess.engine.Score | None, float]] = {}
+        self.bar_display_share = 0.5
+        self.bar_target_share = 0.5
+        self.bar_last_score: chess.engine.Score | None = None
+        self.bar_job: str | None = None
         self.best_arrow_cache: dict[int, chess.Move] = {}
         self.reviewing = False
         self.review_stage = "manual"
@@ -549,7 +554,7 @@ class ChessReviewApp:
         dialog.geometry("1000x740")
         dialog.transient(self.root)
         dialog.grab_set()
-        ttk.Label(dialog, text="Mở ván ở vị trí ban đầu, chọn cửa sổ, rồi khoanh đúng 8×8 ô bàn cờ.",
+        ttk.Label(dialog, text="Chọn cửa sổ, khoanh đúng 8×8 ô và đặt lượt đi hiện tại (kể cả giữa ván).",
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 5))
         titles = [f"{title[:95]}  [{hwnd}]" for hwnd, title in windows]
         selection = ttk.Combobox(dialog, values=titles, state="readonly")
@@ -628,7 +633,7 @@ class ChessReviewApp:
                 status.set(str(exc))
                 return
             state["box"] = box
-            status.set("Đã chọn bàn cờ. Để cửa sổ này mở ở vị trí ban đầu rồi bấm Bắt đầu.")
+            status.set("Đã chọn bàn cờ. Kiểm tra lượt hiện tại rồi bấm Bắt đầu theo dõi.")
 
         preview.bind("<ButtonPress-1>", press)
         preview.bind("<B1-Motion>", drag)
@@ -638,6 +643,11 @@ class ChessReviewApp:
         ttk.Button(buttons, text="Chụp cửa sổ", command=take_preview).pack(side="left")
         flipped = tk.BooleanVar(value=self.flipped)
         ttk.Checkbutton(buttons, text="Đen ở dưới", variable=flipped).pack(side="left", padx=12)
+        ttk.Label(buttons, text="Lượt hiện tại:").pack(side="left", padx=(12, 4))
+        turn_selection = ttk.Combobox(buttons, values=("Trắng", "Đen"),
+                                      width=7, state="readonly")
+        turn_selection.current(0)
+        turn_selection.pack(side="left")
 
         def begin() -> None:
             box = state["box"]
@@ -650,24 +660,29 @@ class ChessReviewApp:
                 if stream is None or state["hwnd"] != hwnd:
                     raise ValueError("Hãy chụp lại cửa sổ đã chọn.")
                 first_frame = board_crop(stream.latest(timeout=4), box)
+                starting_board = recognize_board(first_frame, flipped.get(),
+                                                 turn_selection.current() == 0)
             except (OSError, ValueError, TimeoutError) as exc:
                 status.set(f"Không đọc được bàn cờ: {exc}")
                 return
+            stream.drain(128)
             state["stream"] = None
             dialog.grab_release()
             dialog.destroy()
-            self._begin_live_capture(hwnd, title, box, flipped.get(), first_frame, stream)
+            self._begin_live_capture(hwnd, title, box, flipped.get(), first_frame,
+                                     stream, starting_board)
 
         ttk.Button(buttons, text="Bắt đầu theo dõi", command=begin,
                    style="Accent.TButton").pack(side="right")
-        dialog.after(150, take_preview)
 
     def _begin_live_capture(self, hwnd: int, title: str,
                             box: tuple[int, int, int, int], flipped: bool,
-                            first_frame, stream: WindowCaptureStream) -> None:
+                            first_frame, stream: WindowCaptureStream,
+                            starting_board: chess.Board) -> None:
         self._new_game()
         self.flipped = flipped
-        self.live_tracker = LiveBoardTracker(chess.Board(), flipped)
+        self.positions = [starting_board]
+        self.live_tracker = LiveBoardTracker(starting_board.copy(stack=True), flipped)
         self.live_tracker.observe(first_frame)
         self.live_stream = stream
         self.live_window = hwnd
@@ -680,9 +695,8 @@ class ChessReviewApp:
         self.live_button.configure(text="Dừng theo dõi")
         self.game_var.set("Đang theo dõi · " + title[:65])
         self.live_status_var.set("Đang nhận nước đi trực tiếp · 0 nước")
-        self._render_board()
-        self._draw_bar(None)
-        self.live_job = self.root.after(350, self._capture_live_tick)
+        self._refresh()
+        self.live_job = self.root.after(60, self._capture_live_tick)
 
     def _capture_live_tick(self) -> None:
         self.live_job = None
@@ -693,15 +707,20 @@ class ChessReviewApp:
         try:
             if self.live_stream.closed:
                 raise OSError("Cửa sổ nguồn đã đóng.")
-            frame = board_crop(self.live_stream.latest(), self.live_region)
-            move = tracker.observe(frame)
+            frames = self.live_stream.drain()
+            if not frames and tracker.unmatched_frames:
+                frames = [self.live_stream.latest()]
+            for source in frames:
+                frame = board_crop(source, self.live_region)
+                for move in tracker.observe(frame):
+                    self._apply_live_move(move)
+                    if self.live_tracker is None:
+                        return
         except (OSError, ValueError, TimeoutError) as exc:
             self._stop_live_capture()
             self.live_status_var.set(f"Đã dừng: {exc}")
             return
-        if move is not None:
-            self._apply_live_move(move)
-        elif tracker.unmatched_frames >= 15:
+        if tracker.unmatched_frames >= 50:
             saved_path = self.live_game_path
             self._stop_live_capture()
             self.live_status_var.set(
@@ -709,7 +728,7 @@ class ChessReviewApp:
                 f"PGN trước đó đã lưu tại {saved_path}. Chọn lại vùng và chiều bàn để theo dõi ván mới."
             )
         if self.live_tracker is not None:
-            self.live_job = self.root.after(350, self._capture_live_tick)
+            self.live_job = self.root.after(60, self._capture_live_tick)
 
     def _apply_live_move(self, move: chess.Move) -> None:
         current = self.positions[-1]
@@ -1017,7 +1036,7 @@ class ChessReviewApp:
         self.manual_save_path = None
         self.manual_branch_source = None
         self._stop_autoplay()
-        self._reset_analysis_cache()
+        self._reset_analysis_cache(reset_bar=True)
         self._clear_annotations()
         self.moves = list(game.mainline_moves())
         player = self.username_var.get().strip().casefold()
@@ -1051,7 +1070,7 @@ class ChessReviewApp:
         self._dismiss_coach_panel()
         self.user_acted = True
         self._stop_autoplay()
-        self._reset_analysis_cache()
+        self._reset_analysis_cache(reset_bar=True)
         self._clear_annotations()
         self.games = []
         self.current_game = None
@@ -1290,16 +1309,24 @@ class ChessReviewApp:
         self.right_dragging = False
         self.drag_item = None
 
-    def _reset_analysis_cache(self) -> None:
+    def _reset_analysis_cache(self, *, reset_bar: bool = False) -> None:
         self.generation += 1
         if self.future is not None:
             self.future.cancel()
         self.analysis_cache.clear()
         self.score_cache.clear()
         self.best_arrow_cache.clear()
+        if reset_bar:
+            if self.bar_job is not None:
+                self.root.after_cancel(self.bar_job)
+                self.bar_job = None
+            self.bar_display_share = self.bar_target_share = 0.5
+            self.bar_last_score = None
 
     def _flip(self) -> None:
         self.flipped = not self.flipped
+        self.bar_display_share = 1 - self.bar_display_share
+        self.bar_target_share = 1 - self.bar_target_share
         self._render_board()
         self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
 
@@ -1454,7 +1481,8 @@ class ChessReviewApp:
     def _draw_arrow(self, start: int, end: int, tag: str) -> None:
         x1, y1 = self._square_center(start)
         x2, y2 = self._square_center(end)
-        if tag in ("annotation_arrow", "preview_arrow") and x1 != x2 and y1 != y2:
+        piece = self.positions[self.ply].piece_at(start)
+        if piece is not None and piece.piece_type == chess.KNIGHT and x1 != x2 and y1 != y2:
             points = (x1, y1, x2, y1, x2, y2)
         else:
             points = (x1, y1, x2, y2)
@@ -1960,20 +1988,37 @@ class ChessReviewApp:
                                fill="#a8d77a", font=("Segoe UI", 10, "bold"))
 
     def _draw_bar(self, score: chess.engine.Score | None, white_ep: float = 0.5) -> None:
-        self.bar.delete("all")
         self.bar_orientation_var.set(
             "Thanh đánh giá: Trắng ở trên, Đen ở dưới" if self.flipped
             else "Thanh đánh giá: Đen ở trên, Trắng ở dưới"
         )
-        bottom_share = 1 - white_ep if self.flipped else white_ep
-        bottom_height = int(BOARD_SIZE * max(0.02, min(0.98, bottom_share)))
+        if score is not None:
+            self.bar_last_score = score
+            bottom_share = 1 - white_ep if self.flipped else white_ep
+            self.bar_target_share = max(0.02, min(0.98, bottom_share))
+        display_score = self.bar_last_score
+        self.eval_var.set(score_text(-display_score if self.flipped else display_score)
+                          if display_score is not None else "0.00")
+        if self.bar_job is None:
+            self._animate_bar()
+
+    def _animate_bar(self) -> None:
+        self.bar_job = None
+        remaining = self.bar_target_share - self.bar_display_share
+        if abs(remaining) < 0.002:
+            self.bar_display_share = self.bar_target_share
+        else:
+            self.bar_display_share += remaining * 0.22
+        self.bar.delete("all")
+        bottom_height = int(BOARD_SIZE * self.bar_display_share)
         top_color = "#f3f3f3" if self.flipped else "#252525"
         bottom_color = "#252525" if self.flipped else "#f3f3f3"
         self.bar.create_rectangle(0, 0, 40, BOARD_SIZE - bottom_height,
                                   fill=top_color, outline="")
         self.bar.create_rectangle(0, BOARD_SIZE - bottom_height, 40, BOARD_SIZE,
                                   fill=bottom_color, outline="")
-        self.eval_var.set(score_text(-score if self.flipped else score) if score else "0.00")
+        if self.bar_display_share != self.bar_target_share:
+            self.bar_job = self.root.after(16, self._animate_bar)
 
     def _request_analysis(self) -> None:
         self.generation += 1
@@ -2310,6 +2355,9 @@ class ChessReviewApp:
 
     def _close(self) -> None:
         self._stop_live_capture()
+        if self.bar_job is not None:
+            self.root.after_cancel(self.bar_job)
+            self.bar_job = None
         self._dismiss_coach_panel()
         self.stats_cancel.set()
         self.overview_cancel.set()

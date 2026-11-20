@@ -5,7 +5,10 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 
 import chess
 from PIL import Image, ImageOps, ImageStat
@@ -43,11 +46,12 @@ class WindowCaptureStream:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._frame: Image.Image | None = None
+        self._frames: deque[Image.Image] = deque(maxlen=128)
         self.closed = False
         self._stopped = False
         self._capture = WindowsCapture(
             window_hwnd=hwnd, cursor_capture=False, draw_border=False,
-            minimum_update_interval=150,
+            minimum_update_interval=0,
         )
 
         @self._capture.event
@@ -56,6 +60,7 @@ class WindowCaptureStream:
                                     frame.frame_buffer.tobytes(), "raw", "BGRX")
             with self._lock:
                 self._frame = image
+                self._frames.append(image)
             self._ready.set()
 
         @self._capture.event
@@ -73,6 +78,12 @@ class WindowCaptureStream:
         if image is None:
             raise OSError("Cửa sổ đã đóng hoặc không thể chụp.")
         return image
+
+    def drain(self, limit: int = 24) -> list[Image.Image]:
+        """Return captured frames in arrival order instead of skipping to the newest."""
+        with self._lock:
+            frames = [self._frames.popleft() for _ in range(min(limit, len(self._frames)))]
+        return frames
 
     def close(self) -> None:
         if not self._stopped:
@@ -97,22 +108,69 @@ def board_crop(image: Image.Image, box: tuple[int, int, int, int]) -> Image.Imag
     return cropped
 
 
+def _cell_signature(cell: Image.Image) -> bytes:
+    cell = ImageOps.grayscale(cell.crop((6, 6, 58, 58)))
+    pixels = list(cell.resize((26, 26), Image.Resampling.BILINEAR).tobytes())
+    background = sorted(pixels)[len(pixels) // 2]
+    return bytes(max(0, min(255, value - background + 128)) for value in pixels)
+
+
 def _signature(image: Image.Image, flipped: bool) -> list[bytes]:
     """Describe piece shapes while discounting solid square and highlight colors."""
     image = image.resize((512, 512), Image.Resampling.BILINEAR)
     signatures: list[bytes] = [b""] * 64
     for row in range(8):
         for col in range(8):
-            cell = ImageOps.grayscale(image.crop((col * 64 + 6, row * 64 + 6,
-                                                  col * 64 + 58, row * 64 + 58)))
-            cell = cell.resize((26, 26), Image.Resampling.BILINEAR)
-            pixels = list(cell.tobytes())
-            background = sorted(pixels)[len(pixels) // 2]
-            signature = bytes(max(0, min(255, value - background + 128)) for value in pixels)
+            cell = image.crop((col * 64, row * 64, col * 64 + 64, row * 64 + 64))
+            signature = _cell_signature(cell)
             file_ = 7 - col if flipped else col
             rank_ = row if flipped else 7 - row
             signatures[chess.square(file_, rank_)] = signature
     return signatures
+
+
+@lru_cache(maxsize=1)
+def _piece_templates() -> dict[bool, dict[str, bytes]]:
+    sprites = Path(__file__).resolve().parent / "pieces"
+    result = {}
+    for dark, background in ((False, "#f0d9b5"), (True, "#b58863")):
+        templates = {".": _cell_signature(Image.new("RGB", (64, 64), background))}
+        for color in "wb":
+            for symbol in "PNBRQK":
+                sprite = Image.open(sprites / f"{color}{symbol}.png").convert("RGBA")
+                cell = Image.new("RGB", (64, 64), background)
+                cell.paste(sprite, (0, 0), sprite)
+                templates[symbol if color == "w" else symbol.lower()] = _cell_signature(cell)
+        result[dark] = templates
+    return result
+
+
+def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> chess.Board:
+    """Read a Neo board from a captured image; fail on ambiguous squares."""
+    templates = _piece_templates()
+    position = chess.Board(None)
+    for square, signature in enumerate(_signature(image, flipped)):
+        dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
+        scores = sorted((_difference(signature, sample), symbol)
+                        for symbol, sample in templates[dark].items())
+        (distance, symbol), (second, _) = scores[:2]
+        if distance > 24 or second - distance < 3:
+            raise ValueError(f"Không nhận rõ quân ở ô {chess.square_name(square)}; "
+                             "hãy khoanh sát bàn cờ và dùng bộ quân Neo.")
+        if symbol != ".":
+            position.set_piece_at(square, chess.Piece.from_symbol(symbol))
+    position.turn = turn
+    position.castling_rights = 0
+    for color, rank in ((chess.WHITE, 0), (chess.BLACK, 7)):
+        king = position.piece_at(chess.square(4, rank))
+        if king == chess.Piece(chess.KING, color):
+            for file_ in (0, 7):
+                square = chess.square(file_, rank)
+                if position.piece_at(square) == chess.Piece(chess.ROOK, color):
+                    position.castling_rights |= chess.BB_SQUARES[square]
+    if not position.is_valid():
+        raise ValueError("Thế cờ nhận từ ảnh không hợp lệ. Kiểm tra lượt đi, vùng bàn và chiều bàn.")
+    return position
 
 
 def _difference(first: bytes, second: bytes) -> float:
@@ -137,28 +195,23 @@ class LiveBoardTracker:
     board: chess.Board
     flipped: bool
     reference: list[bytes] | None = None
-    pending: list[bytes] | None = None
-    pending_count: int = 0
     unmatched_frames: int = 0
+    last_unmatched: list[bytes] | None = None
 
-    def observe(self, image: Image.Image) -> chess.Move | None:
+    def observe(self, image: Image.Image) -> list[chess.Move]:
         current = _signature(image, self.flipped)
         if self.reference is None:
             self.reference = current
-            return None
-        if self.pending is not None and max(
-            _difference(a, b) for a, b in zip(self.pending, current)
-        ) < 2.5:
-            self.pending_count += 1
-        else:
-            self.pending = current
-            self.pending_count = 1
-        if self.pending_count < 2:
-            return None
+            return []
         changes = [_difference(a, b) for a, b in zip(self.reference, current)]
         if max(changes) < 7:
             self.unmatched_frames = 0
-            return None
+            return []
+        if self.last_unmatched is not None and max(
+            _difference(a, b) for a, b in zip(self.last_unmatched, current)
+        ) < 2.5:
+            self.unmatched_frames += 1
+            return []
         candidates: list[tuple[float, chess.Move, set[int]]] = []
         seen: set[tuple[int, int]] = set()
         for move in sorted(self.board.legal_moves,
@@ -174,21 +227,51 @@ class LiveBoardTracker:
             spill = sum(sorted((amount for square, amount in enumerate(changes)
                                 if square not in changed), reverse=True)[:2])
             candidates.append((signal - spill, move, changed))
-        if not candidates:
-            self.unmatched_frames += 1
-            return None
         candidates.sort(key=lambda item: item[0], reverse=True)
-        best_score, move, expected = candidates[0]
-        if best_score < 22 or (len(candidates) > 1 and best_score - candidates[1][0] < 4):
+        if candidates:
+            best_score, move, expected = candidates[0]
+            if (best_score >= 22
+                    and (len(candidates) == 1 or best_score - candidates[1][0] >= 4)
+                    and sum(amount for square, amount in enumerate(changes)
+                            if square not in expected and amount > 8)
+                    <= sum(changes[s] for s in expected) * .55):
+                self.board.push(move)
+                self.reference = current
+                self.unmatched_frames = 0
+                self.last_unmatched = None
+                return [move]
+
+        # Two moves may occur between captured frames. Match the visible piece
+        # placement to legal pairs rather than guessing a single move.
+        try:
+            target = recognize_board(image, self.flipped, self.board.turn).piece_map()
+        except ValueError:
+            self.last_unmatched = current
             self.unmatched_frames += 1
-            return None
-        if sum(amount for square, amount in enumerate(changes)
-               if square not in expected and amount > 8) > sum(changes[s] for s in expected) * .55:
-            self.unmatched_frames += 1
-            return None
-        self.board.push(move)
-        self.reference = current
-        self.pending = None
-        self.pending_count = 0
-        self.unmatched_frames = 0
-        return move
+            return []
+        if target == self.board.piece_map():
+            self.reference = current
+            self.unmatched_frames = 0
+            self.last_unmatched = None
+            return []
+        matches: list[tuple[chess.Move, chess.Move]] = []
+        probe = self.board.copy(stack=False)
+        for first in list(probe.legal_moves):
+            probe.push(first)
+            for second in list(probe.legal_moves):
+                probe.push(second)
+                if probe.piece_map() == target:
+                    matches.append((first, second))
+                probe.pop()
+            probe.pop()
+        if len(matches) == 1:
+            pair = list(matches[0])
+            for move in pair:
+                self.board.push(move)
+            self.reference = current
+            self.unmatched_frames = 0
+            self.last_unmatched = None
+            return pair
+        self.last_unmatched = current
+        self.unmatched_frames += 1
+        return []
