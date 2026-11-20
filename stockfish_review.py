@@ -208,6 +208,9 @@ class ChessReviewApp:
         self.user_acted = False
         self.current_game_path: Path | None = None
         self.game_paths: list[Path] = []
+        self.original_review_state: dict | None = None
+        self.variation_save_path: Path | None = None
+        self.variation_start_ply: int | None = None
         self.overview_events: queue.Queue = queue.Queue()
         self.overview_generation = 0
         self.overview_cancel = threading.Event()
@@ -687,6 +690,9 @@ class ChessReviewApp:
 
     def _load_game(self, game: chess.pgn.Game) -> None:
         self.current_game = game
+        self.original_review_state = None
+        self.variation_save_path = None
+        self.variation_start_ply = None
         self._update_favorite_button()
         self.manual_save_path = None
         self._stop_autoplay()
@@ -708,7 +714,7 @@ class ChessReviewApp:
         self.coach_button.configure(state="disabled")
         self.coach_tip_row.pack_forget()
         self.stats_button.configure(state="normal")
-        self.review_button.configure(state="disabled")
+        self.review_button.configure(text="Xem lại", command=self._review_manual, state="disabled")
         self.move_entry.configure(state="disabled")
         self.play_button.configure(state="disabled")
         self.game_var.set(f"{game.headers.get('White', 'Trắng')} – {game.headers.get('Black', 'Đen')}")
@@ -724,6 +730,9 @@ class ChessReviewApp:
         self.current_game = None
         self.current_game_path = None
         self.game_paths = []
+        self.original_review_state = None
+        self.variation_save_path = None
+        self.variation_start_ply = None
         self._update_favorite_button()
         self.manual_save_path = None
         self.moves = []
@@ -738,7 +747,7 @@ class ChessReviewApp:
         self.coach_button.configure(state="disabled")
         self.coach_tip_row.pack_forget()
         self.stats_button.configure(state="disabled")
-        self.review_button.configure(state="disabled")
+        self.review_button.configure(text="Xem lại", command=self._review_manual, state="disabled")
         self.move_entry.configure(state="normal")
         self.play_button.configure(state="normal")
         self.entry_row.pack(fill="x", pady=(8, 0), before=self.analysis_separator)
@@ -757,6 +766,9 @@ class ChessReviewApp:
         game.headers["Black"] = "Đen"
         self.games = [game]
         self.current_game = game
+        self.original_review_state = None
+        self.variation_save_path = None
+        self.variation_start_ply = None
         self.current_game_path = self.manual_save_path
         self.game_paths = [self.manual_save_path] if self.manual_save_path else []
         self._update_favorite_button()
@@ -863,6 +875,9 @@ class ChessReviewApp:
             board = self.positions[index]
             prefix = f"{board.fullmove_number}{'.' if board.turn else '...'}"
             self.move_list.insert("end", f"{prefix} {board.san(move)}")
+            if self.original_review_state is not None and self.variation_start_ply is not None:
+                if index >= self.variation_start_ply:
+                    self.move_list.itemconfigure(index, foreground="#f2c66e")
 
     def _select_move(self, _event: tk.Event) -> None:
         if not self.reviewing:
@@ -949,8 +964,13 @@ class ChessReviewApp:
         row = rank_ if self.flipped else 7 - rank_
         return (col + 0.5) * SQUARE, (row + 0.5) * SQUARE
 
+    def _can_move_board(self) -> bool:
+        return not self.reviewing or self.review_stage == "step"
+
     def _legal_move(self, start: int, end: int) -> chess.Move | None:
-        board = self.positions[-1]
+        if not self._can_move_board():
+            return None
+        board = self.positions[self.ply]
         piece = board.piece_at(start)
         if piece is None or piece.color != board.turn:
             return None
@@ -966,10 +986,10 @@ class ChessReviewApp:
 
     def _left_motion(self, event: tk.Event) -> None:
         start = self.left_press_square
-        if start is None or self.reviewing or self.positions[-1].is_game_over():
+        if start is None or not self._can_move_board() or self.positions[self.ply].is_game_over():
             return
-        piece = self.positions[-1].piece_at(start)
-        if piece is None or piece.color != self.positions[-1].turn:
+        piece = self.positions[self.ply].piece_at(start)
+        if piece is None or piece.color != self.positions[self.ply].turn:
             return
         if not self.left_dragging:
             x0, y0 = self.left_press_xy
@@ -1000,14 +1020,14 @@ class ChessReviewApp:
             self._render_board()
             return
         if dragging and start is not None:
-            move = None if self.reviewing else self._legal_move(start, target)
+            move = self._legal_move(start, target)
             if move is not None:
                 self._play_move(move)
             else:
-                self.selected_square = start if not self.reviewing else None
+                self.selected_square = start if self._can_move_board() else None
                 self._render_board()
             return
-        if self.reviewing:
+        if not self._can_move_board():
             self._remove_annotations_at(target)
             self._render_board()
             return
@@ -1024,7 +1044,7 @@ class ChessReviewApp:
             self._remove_annotations_at(target)
             self._render_board()
             return
-        board = self.positions[-1]
+        board = self.positions[self.ply]
         piece = board.piece_at(target)
         self.selected_square = target if piece and piece.color == board.turn else None
         self._render_board()
@@ -1085,12 +1105,12 @@ class ChessReviewApp:
         )
 
     def _enter_move(self, _event: tk.Event | None = None) -> None:
-        if self.reviewing:
+        if not self._can_move_board():
             return
         raw = self.move_entry.get().strip()
         if not raw:
             return
-        board = self.positions[-1]
+        board = self.positions[self.ply]
         try:
             move = board.parse_san(raw)
         except ValueError:
@@ -1106,6 +1126,10 @@ class ChessReviewApp:
 
     def _play_move(self, move: chess.Move) -> None:
         self.user_acted = True
+        if self.reviewing:
+            if self.review_stage == "step":
+                self._play_variation_move(move)
+            return
         board = self.positions[-1].copy(stack=True)
         self.moves.append(move)
         board.push(move)
@@ -1129,6 +1153,105 @@ class ChessReviewApp:
             self.review_button.configure(state="normal")
             self.status_var.set("Ván đã kết thúc. Bấm Xem lại để bật phân tích sâu.")
         self._refresh()
+
+    def _play_variation_move(self, move: chess.Move) -> None:
+        board = self.positions[self.ply]
+        if move not in board.legal_moves:
+            return
+        if self.ply < len(self.moves) and self.moves[self.ply] == move:
+            self._go_to(self.ply + 1)
+            return
+        self._stop_autoplay()
+        if self.original_review_state is None:
+            self.original_review_state = {
+                "moves": self.moves[:],
+                "positions": self.positions[:],
+                "analysis_cache": self.analysis_cache.copy(),
+                "score_cache": self.score_cache.copy(),
+                "overview_assessments": self.overview_assessments.copy(),
+                "overview_points": self.overview_points[:],
+                "current_game_path": self.current_game_path,
+                "game": self.current_game,
+                "game_var": self.game_var.get(),
+                "ply": self.ply,
+            }
+        if self.ply < len(self.moves) or self.variation_save_path is None:
+            self.variation_save_path = GAMES_DIR / local_filename("nhanh-phan-tich", ".pgn")
+            self.variation_start_ply = self.ply
+        branch_from = self.ply
+        self.generation += 1
+        if self.future is not None:
+            self.future.cancel()
+        self.analysis_cache = {key: value for key, value in self.analysis_cache.items()
+                               if key[0] <= branch_from}
+        self.score_cache = {key: value for key, value in self.score_cache.items()
+                            if key <= branch_from}
+        self.overview_assessments = {
+            key: value for key, value in self.overview_assessments.items()
+            if key <= branch_from
+        }
+        self.moves = self.moves[:branch_from]
+        self.positions = self.positions[:branch_from + 1]
+        changed = board.copy(stack=True)
+        changed.push(move)
+        self.moves.append(move)
+        self.positions.append(changed)
+        self.ply = len(self.moves)
+        self._clear_annotations()
+        self.current_game_path = self.variation_save_path
+        self.game_var.set(f"Nhánh phân tích · {self.original_review_state['game_var']}")
+        self.review_button.configure(text="Ván gốc", command=self._return_to_original,
+                                     state="normal")
+        self.stats_button.configure(state="disabled")
+        self._update_favorite_button()
+        self._fill_moves()
+        try:
+            GAMES_DIR.mkdir(parents=True, exist_ok=True)
+            saved = chess.pgn.Game.from_board(changed)
+            source_game = self.original_review_state["game"]
+            if source_game is not None:
+                saved.headers["White"] = source_game.headers.get("White", "Trắng")
+                saved.headers["Black"] = source_game.headers.get("Black", "Đen")
+            saved.headers["Event"] = "Nhánh phân tích"
+            saved.headers["BranchPly"] = str(self.variation_start_ply)
+            source_path = self.original_review_state["current_game_path"]
+            if source_path is not None:
+                saved.headers["SourcePGN"] = source_path.name
+            temporary = self.variation_save_path.with_suffix(".part")
+            temporary.write_text(str(saved) + "\n", encoding="utf-8")
+            temporary.replace(self.variation_save_path)
+            self._update_favorite_button()
+        except OSError as exc:
+            messagebox.showerror("Không lưu được nhánh phân tích", str(exc))
+        self._refresh()
+
+    def _return_to_original(self) -> None:
+        original = self.original_review_state
+        if original is None:
+            return
+        self._stop_autoplay()
+        self._reset_analysis_cache()
+        self._clear_annotations()
+        self.moves = original["moves"]
+        self.positions = original["positions"]
+        self.analysis_cache = original["analysis_cache"]
+        self.score_cache = original["score_cache"]
+        self.overview_assessments = original["overview_assessments"]
+        self.overview_points = original["overview_points"]
+        self.current_game_path = original["current_game_path"]
+        self.current_game = original["game"]
+        self.game_var.set(original["game_var"])
+        self.ply = original["ply"]
+        self.original_review_state = None
+        self.variation_save_path = None
+        self.variation_start_ply = None
+        self.review_button.configure(text="Xem lại", command=self._review_manual,
+                                     state="disabled")
+        self.stats_button.configure(state="normal")
+        self._update_favorite_button()
+        self._fill_moves()
+        self._refresh()
+        self.status_var.set("Đã quay về ván gốc. Nhánh phân tích vẫn có trong Ván đã lưu.")
 
     def _toggle_full(self) -> None:
         if not self.reviewing:
@@ -1264,9 +1387,18 @@ class ChessReviewApp:
         if self.review_stage == "step":
             if self.ply:
                 san = self.positions[self.ply - 1].san(self.moves[self.ply - 1])
-                self.coach_tip_var.set(f"Bruno: {san} là thời điểm ta đang xem. Nhấn ‘Hỏi HLV Bruno’ để biết vì sao và xem biến thể thay thế.")
+                if self.original_review_state is not None:
+                    self.coach_tip_var.set(
+                        f"Bruno: Đang thử nhánh sau {san}. Cứ đi tiếp trên bàn; bấm Ván gốc để quay lại."
+                    )
+                else:
+                    self.coach_tip_var.set(
+                        f"Bruno: {san} là nước đang xem. Bạn có thể bấm hoặc kéo quân để thử hướng khác."
+                    )
             else:
-                self.coach_tip_var.set("Bruno: Bắt đầu từ thế cờ ban đầu. Dùng các nút bên dưới để đi qua từng nước.")
+                self.coach_tip_var.set(
+                    "Bruno: Dùng các nút để xem từng nước, hoặc tự đi quân trên bàn để tạo nhánh mới."
+                )
         if cached:
             self._display_analysis(cached)
         elif overview:
@@ -1302,7 +1434,7 @@ class ChessReviewApp:
         for start, end in sorted(self.arrows):
             self._draw_arrow(start, end, "annotation_arrow")
         legal_targets = set()
-        if self.selected_square is not None and not self.reviewing:
+        if self.selected_square is not None and self._can_move_board():
             legal_targets = {move.to_square for move in board.legal_moves
                              if move.from_square == self.selected_square}
         for row in range(8):
