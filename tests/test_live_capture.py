@@ -6,7 +6,7 @@ import unittest
 import chess
 from PIL import Image, ImageDraw
 
-from live_capture import LiveBoardTracker, recognize_board
+from live_capture import LiveBoardTracker, align_board, recognize_board
 
 
 PIECES = Path(__file__).resolve().parents[1] / "pieces"
@@ -131,6 +131,22 @@ class LiveCaptureTests(unittest.TestCase):
         self.assertEqual(board.board_fen(), found.board_fen())
         self.assertEqual(list(board.move_stack),
                          tracker.observe(render(board, light="#ffffff", dark="#ffdda3")))
+
+    def test_aligns_selected_border_at_start_and_midgame(self) -> None:
+        board = chess.Board()
+        for opening in ((), ("e4", "e5", "Nf3")):
+            for san in opening:
+                board.push_san(san)
+            framed = Image.new("RGB", (526, 526), "#deb230")
+            framed.paste(render(board), (7, 7))
+            box, found, _ = align_board(framed, (0, 0, 526, 526), False, board.turn)
+            self.assertEqual(board.board_fen(), found.board_fen())
+            self.assertTrue(4 <= box[0] <= 10)
+
+    def test_alignment_does_not_invent_starting_pieces_on_empty_board(self) -> None:
+        empty = render(chess.Board(None))
+        with self.assertRaises(ValueError):
+            align_board(empty, (0, 0, 512, 512), False, chess.WHITE)
 
 
 if __name__ == "__main__":

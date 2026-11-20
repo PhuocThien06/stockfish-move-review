@@ -198,6 +198,58 @@ def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> che
     return position
 
 
+def align_board(image: Image.Image, box: tuple[int, int, int, int],
+                flipped: bool, turn: chess.Color,
+                ) -> tuple[tuple[int, int, int, int], chess.Board, Image.Image]:
+    """Trim a small selected border and select the clearest legal board."""
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    valid: list[tuple[float, tuple[int, int, int, int], chess.Board, Image.Image]] = []
+    initial: list[tuple[float, tuple[int, int, int, int], chess.Board, Image.Image]] = []
+    last_error = "Không nhận được bàn cờ từ vùng đã chọn."
+    start = chess.Board()
+    for fraction in (0, .005, .01, .015, .02, .025):
+        dx, dy = round(width * fraction), round(height * fraction)
+        candidate = (left + dx, top + dy, right - dx, bottom - dy)
+        try:
+            cropped = board_crop(image, candidate)
+        except ValueError as exc:
+            last_error = str(exc)
+            continue
+        backgrounds = _square_backgrounds(cropped, flipped)
+        templates = _piece_templates(*backgrounds)
+        signatures = _signature(cropped, flipped)
+        costs = []
+        for square, signature in enumerate(signatures):
+            dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
+            costs.append({symbol: _difference(signature, sample)
+                          for symbol, sample in templates[dark].items()})
+        greedy_cost = sum(min(cell.values()) for cell in costs)
+        try:
+            board = recognize_board(cropped, flipped, turn)
+        except ValueError as exc:
+            last_error = str(exc)
+        else:
+            valid.append((greedy_cost, candidate, board, cropped))
+        if turn == chess.WHITE:
+            middle_empty = sum(min(costs[square], key=costs[square].get) == "."
+                               for square in chess.SQUARES
+                               if 2 <= chess.square_rank(square) <= 5)
+            start_cost = sum(costs[square][start.piece_at(square).symbol()
+                                            if start.piece_at(square) else "."]
+                             for square in chess.SQUARES)
+            if (middle_empty >= 30 and start_cost <= 900
+                    and start_cost - greedy_cost <= max(25, greedy_cost * .07)):
+                initial.append((start_cost, candidate, start.copy(), cropped))
+    if initial:
+        _, candidate, board, cropped = min(initial, key=lambda item: item[0])
+        return candidate, board, cropped
+    if valid:
+        _, candidate, board, cropped = min(valid, key=lambda item: item[0])
+        return candidate, board, cropped
+    raise ValueError(last_error)
+
+
 def _difference(first: bytes, second: bytes) -> float:
     return sum(abs(a - b) for a, b in zip(first, second)) / len(first)
 

@@ -32,8 +32,8 @@ from chesscom_import import sync_recent_games
 from coach import explain_move
 from grade_badges import draw_badge, make_badge, text_color
 from local_store import load_favorites, prune_old_games, save_favorites
-from live_capture import (LiveBoardTracker, WindowCaptureStream, board_crop,
-                          recognize_board, reduce_glare, visible_windows)
+from live_capture import (LiveBoardTracker, WindowCaptureStream, align_board,
+                          board_crop, reduce_glare, visible_windows)
 from material import DISPLAY_ORDER, material_snapshot
 
 
@@ -661,9 +661,10 @@ class ChessReviewApp:
                 stream = state["stream"]
                 if stream is None or state["hwnd"] != hwnd:
                     raise ValueError("Hãy chụp lại cửa sổ đã chọn.")
-                first_frame = board_crop(stream.latest(timeout=4), box)
-                starting_board = recognize_board(first_frame, flipped.get(),
-                                                 turn_selection.current() == 0)
+                box, starting_board, first_frame = align_board(
+                    stream.latest(timeout=4), box, flipped.get(),
+                    turn_selection.current() == 0,
+                )
             except (OSError, ValueError, TimeoutError) as exc:
                 status.set(f"Không đọc được bàn cờ: {exc}")
                 return
