@@ -31,6 +31,7 @@ from analysis_core import (
 from chesscom_import import sync_recent_games
 from coach import explain_move
 from local_store import load_favorites, prune_old_games, save_favorites
+from material import DISPLAY_ORDER, material_snapshot
 
 
 PIECES = {
@@ -178,7 +179,7 @@ def compute_overview(
         for index, move in enumerate(moves, 1):
             if cancel.is_set():
                 return {"cancelled": True}
-            assessment = assess_move(engine, board, move, 0.12)
+            assessment = assess_move(engine, board, move, 0.20)
             assessments.append(assessment)
             progress.put((generation, "move", index, len(moves), assessment))
             board.push(move)
@@ -198,6 +199,12 @@ class ChessReviewApp:
             for color in "wb" for piece in "KQRBNP"
             if (piece_folder / f"{color}{piece}.png").is_file()
         }
+        self.capture_icons = {
+            (color, piece): image.subsample(4, 4)
+            for (color, piece), image in self.piece_images.items()
+            if piece in "PNBRQ"
+        }
+        self.material_state: dict = {}
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.analysis_engine = EngineSession()
         self.stats_executor = ThreadPoolExecutor(max_workers=1)
@@ -318,12 +325,21 @@ class ChessReviewApp:
         main.pack(fill="both", expand=True)
         left = ttk.Frame(main)
         left.pack(side="left", fill="y")
-        self.bar = tk.Canvas(left, width=40, height=BOARD_SIZE, highlightthickness=1,
+        info_width = BOARD_SIZE + 50
+        self.top_material = tk.Canvas(left, width=info_width, height=38,
+                                      bg="#2b2926", highlightthickness=0)
+        self.top_material.pack(anchor="w")
+        board_row = ttk.Frame(left)
+        board_row.pack(anchor="w")
+        self.bar = tk.Canvas(board_row, width=40, height=BOARD_SIZE, highlightthickness=1,
                              highlightbackground="#645b50", bg="#252525")
         self.bar.pack(side="left", anchor="n", padx=(0, 8))
-        self.board_canvas = tk.Canvas(left, width=BOARD_SIZE, height=BOARD_SIZE,
+        self.board_canvas = tk.Canvas(board_row, width=BOARD_SIZE, height=BOARD_SIZE,
                                       highlightthickness=1, highlightbackground="#645b50")
         self.board_canvas.pack(side="left", anchor="n")
+        self.bottom_material = tk.Canvas(left, width=info_width, height=38,
+                                         bg="#2b2926", highlightthickness=0)
+        self.bottom_material.pack(anchor="w")
         self.board_canvas.bind("<ButtonPress-1>", self._left_press)
         self.board_canvas.bind("<B1-Motion>", self._left_motion)
         self.board_canvas.bind("<ButtonRelease-1>", self._left_release)
@@ -1100,8 +1116,8 @@ class ChessReviewApp:
         x1, y1 = self._square_center(start)
         x2, y2 = self._square_center(end)
         self.board_canvas.create_line(
-            x1, y1, x2, y2, fill="#efae22", width=10,
-            arrow=tk.LAST, arrowshape=(18, 22, 8), tags=tag,
+            x1, y1, x2, y2, fill="#efae22", width=14,
+            arrow=tk.LAST, arrowshape=(24, 32, 12), tags=tag,
         )
 
     def _enter_move(self, _event: tk.Event | None = None) -> None:
@@ -1471,6 +1487,41 @@ class ChessReviewApp:
                                                   text=chess.FILE_NAMES[file_], anchor="se",
                                                   font=("Segoe UI", 8, "bold"),
                                                   fill="#ffffff" if (file_ + rank_) % 2 == 0 else "#333333")
+        self._render_material()
+
+    def _render_material(self) -> None:
+        self.material_state = material_snapshot(self.positions[0], self.moves, self.ply)
+        top_color = chess.WHITE if self.flipped else chess.BLACK
+        self._draw_material_side(self.top_material, top_color)
+        self._draw_material_side(self.bottom_material, not top_color)
+
+    def _draw_material_side(self, canvas: tk.Canvas, color: chess.Color) -> None:
+        canvas.delete("all")
+        if self.current_game is None:
+            name = "Trắng" if color == chess.WHITE else "Đen"
+        else:
+            name = self.current_game.headers.get("White" if color == chess.WHITE else "Black", "?")
+        canvas.create_text(52, 3, text=name, anchor="nw", fill="#f3f0e9",
+                           font=("Segoe UI", 9, "bold"))
+        captured = self.material_state["captured"][color]
+        count = sum(captured.values())
+        x = 58
+        icon_color = "b" if color == chess.WHITE else "w"
+        for piece_type in DISPLAY_ORDER:
+            icon = self.capture_icons.get((icon_color, chess.piece_symbol(piece_type).upper()))
+            for _ in range(captured[piece_type]):
+                if icon is not None:
+                    canvas.create_image(x + 8, 28, image=icon)
+                else:
+                    canvas.create_text(x + 8, 28, text=chess.piece_symbol(piece_type).upper(),
+                                       fill="#e8e3d8", font=("Segoe UI", 10, "bold"))
+                x += 18
+        canvas.create_text(x + 5, 28, text=f"Đã ăn {count}", anchor="w",
+                           fill="#bcb6aa", font=("Segoe UI", 9))
+        lead = self.material_state["balance"] * (1 if color == chess.WHITE else -1)
+        if lead > 0:
+            canvas.create_text(x + 83, 28, text=f"+{lead}", anchor="w",
+                               fill="#a8d77a", font=("Segoe UI", 10, "bold"))
 
     def _draw_bar(self, score: chess.engine.Score | None, white_ep: float = 0.5) -> None:
         self.bar.delete("all")
@@ -1490,7 +1541,7 @@ class ChessReviewApp:
             self.status_var.set("Chọn stockfish.exe để bắt đầu phân tích.")
             return
         try:
-            seconds = float(self.seconds_var.get()) if self.full else 0.35
+            seconds = float(self.seconds_var.get()) if self.full else 0.60
         except ValueError:
             seconds = 2.0
         previous = self.positions[self.ply - 1].copy(stack=True) if self.ply else None
@@ -1555,27 +1606,40 @@ class ChessReviewApp:
         popup = tk.Toplevel(self.root)
         popup.title("Hỏi HLV Bruno · giải thích nước đi")
         popup.configure(bg="#211f1c")
-        popup.geometry("660x620")
+        popup.geometry(
+            f"560x610+{self.root.winfo_rootx() + BOARD_SIZE + 60}"
+            f"+{self.root.winfo_rooty() + 35}"
+        )
         header = ttk.Frame(popup, padding=12)
         header.pack(fill="x")
         if self.coach_image_popup:
             ttk.Label(header, image=self.coach_image_popup).pack(side="left", padx=(0, 12))
         ttk.Label(header, text="Bruno · HLV cờ\nHỏi về nước vừa chọn. Mình sẽ đối chiếu các biến thể Stockfish và vị trí thật trên bàn.",
-                  wraplength=470, font=("Segoe UI", 11)).pack(side="left", fill="x", expand=True)
+                  wraplength=350, font=("Segoe UI", 11)).pack(side="left", fill="x", expand=True)
         question = tk.StringVar(value="Tại sao nước này được đánh giá như vậy?")
         entry = ttk.Entry(popup, textvariable=question)
         entry.pack(fill="x", padx=12, pady=(0, 8))
-        response = tk.Text(popup, wrap="word", font=("Segoe UI", 10),
+        response = tk.Text(popup, height=8, wrap="word", font=("Segoe UI", 10),
                            bg="#302d29", fg="#f2eee8", borderwidth=0,
                            padx=14, pady=12)
         response.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         chosen_ply = self.ply
+        before_board = self.positions[chosen_ply - 1].copy(stack=True)
+        played_move = self.moves[chosen_ply - 1]
+        assessment_holder: dict = {"value": None}
+        line_state: dict = {"moves": [], "index": 0, "board": None}
+
+        def find_assessment() -> dict | None:
+            for mode in (self.full, not self.full):
+                cached = self.analysis_cache.get((chosen_ply, mode))
+                if cached and cached.get("assessment"):
+                    return cached["assessment"]
+            return self.overview_assessments.get(chosen_ply)
 
         def answer(attempt: int = 0) -> None:
             if not popup.winfo_exists():
                 return
-            cached = self.analysis_cache.get((chosen_ply, self.full))
-            assessment = (cached or {}).get("assessment") or self.overview_assessments.get(chosen_ply)
+            assessment = assessment_holder["value"] or find_assessment()
             if assessment is None and attempt < 30:
                 response.delete("1.0", "end")
                 response.insert("1.0", "Bruno đang xem lại vị trí và các biến thể…")
@@ -1584,13 +1648,72 @@ class ChessReviewApp:
             if assessment is None:
                 content = "Chưa lấy được dữ liệu từ Stockfish. Hãy kiểm tra đường dẫn engine rồi thử lại."
             else:
-                content = explain_move(self.positions[chosen_ply - 1],
-                                       self.moves[chosen_ply - 1], assessment, question.get())
+                assessment_holder["value"] = assessment
+                content = explain_move(before_board, played_move, assessment, question.get())
+                if assessment.get("best_pv"):
+                    content += "\n\nBấm ‘Đi nước mạnh nhất trên bàn’ để xem quân di chuyển thật, rồi bấm ‘Xem tiếp biến thể’."
+                    best_button.configure(state="normal")
             response.delete("1.0", "end")
             response.insert("1.0", content)
 
-        ttk.Button(popup, text="Giải thích cho tôi", command=answer,
-                   style="Accent.TButton").pack(fill="x", padx=12, pady=(0, 12))
+        def append_note(note: str) -> None:
+            response.insert("end", f"\n\nBruno: {note}")
+            response.see("end")
+
+        def play_best() -> None:
+            assessment = assessment_holder["value"]
+            pv = assessment.get("best_pv", []) if assessment else []
+            if not pv or self.review_stage != "step" or chosen_ply > len(self.moves):
+                return
+            if (self.positions[chosen_ply - 1].fen() != before_board.fen()
+                    or self.moves[chosen_ply - 1] != played_move):
+                append_note("Vị trí đã thay đổi. Hãy quay về ván gốc rồi chọn lại nước cần giải thích.")
+                return
+            self._go_to(chosen_ply - 1)
+            if pv[0] not in self.positions[self.ply].legal_moves:
+                append_note("Không thể đi biến thể này từ vị trí hiện tại.")
+                return
+            san = self.positions[self.ply].san(pv[0])
+            line_state["moves"] = pv[:]
+            line_state["index"] = 0
+            line_state["board"] = before_board.copy(stack=True)
+            self._play_move(pv[0])
+            line_state["board"].push(pv[0])
+            line_state["index"] = 1
+            next_button.configure(state="normal" if len(pv) > 1 else "disabled")
+            append_note(f"Đã đi {san} trên bàn. Đây là nước Stockfish chọn từ vị trí trước nước bạn hỏi.")
+
+        def play_next() -> None:
+            moves = line_state["moves"]
+            index = line_state["index"]
+            expected = line_state["board"]
+            if index >= len(moves) or expected is None or self.review_stage != "step":
+                return
+            current = self.positions[self.ply]
+            if current.fen() != expected.fen():
+                append_note("Bạn đã đổi vị trí trên bàn. Bấm lại ‘Đi nước mạnh nhất trên bàn’ để xem từ đầu.")
+                return
+            move = moves[index]
+            if move not in current.legal_moves:
+                append_note("Biến thể không còn hợp lệ từ vị trí này.")
+                return
+            san = current.san(move)
+            self._play_move(move)
+            expected.push(move)
+            line_state["index"] = index + 1
+            next_button.configure(state="normal" if index + 1 < len(moves) else "disabled")
+            append_note(f"Tiếp theo {san}. Bạn có thể dừng ở đây và tự thử nước khác trên bàn.")
+
+        buttons = ttk.Frame(popup, padding=(12, 0, 12, 12))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Giải thích", command=answer,
+                   style="Accent.TButton").pack(side="left")
+        best_button = ttk.Button(buttons, text="Đi nước mạnh nhất trên bàn",
+                                 command=play_best, state="disabled")
+        best_button.pack(side="left", padx=6)
+        next_button = ttk.Button(buttons, text="Xem tiếp biến thể", command=play_next,
+                                 state="disabled")
+        next_button.pack(side="left")
         entry.bind("<Return>", lambda _event: answer())
         answer()
 

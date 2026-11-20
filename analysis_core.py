@@ -75,11 +75,19 @@ def _is_clear_sacrifice(board: chess.Board, move: chess.Move, pv: list[chess.Mov
     piece = board.piece_at(move.from_square)
     if piece is None or piece.piece_type not in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
         return False
-    if len(pv) < 2:
+    if len(pv) < 2 or pv[0] != move:
+        return False
+    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+              chess.ROOK: 5, chess.QUEEN: 9}
+    victim = board.piece_at(move.to_square)
+    gained = values.get(victim.piece_type, 0) if victim else 0
+    if values[piece.piece_type] - gained < 2:
         return False
     after = board.copy(stack=False)
     after.push(move)
     reply = pv[1]
+    if reply not in after.legal_moves:
+        return False
     target = after.piece_at(reply.to_square)
     return bool(
         after.is_capture(reply) and target is not None
@@ -109,15 +117,19 @@ def classify_move(
     elif _is_book_move(board, move) and ep_loss <= 0.05:
         category = "book"
     elif (ep_loss <= 0.02 and _is_clear_sacrifice(board, move, played_pv)
-          and played_ep >= 0.40 and best_ep < 0.95):
+          and played_ep >= 0.45 and best_ep < 0.90):
         category = "brilliant"
     elif exact_best and second_info is not None and (
-        best_ep - expected_points(second_info, mover) >= 0.10
-    ) and best_ep < 0.95:
+        best_ep - expected_points(second_info, mover) >= 0.12
+    ) and played_ep >= 0.45 and best_ep < 0.98:
         category = "great"
     elif exact_best:
         category = "best"
-    elif best_ep >= 0.75 and played_ep <= 0.55 and ep_loss >= 0.10:
+    elif ep_loss >= 0.10 and (
+        (best_ep >= 0.75 and played_ep <= 0.55)
+        or (best_score.mate() is not None and best_score.mate() > 0
+            and played_score.mate() is None and played_ep < 0.75)
+    ):
         category = "miss"
     elif ep_loss <= 0.02:
         category = "excellent"
@@ -157,10 +169,14 @@ def assess_move(
     )
     if isinstance(best_lines, dict):
         best_lines = [best_lines]
-    played_info = engine.analyse(
-        board, limit, root_moves=[move],
-        info=chess.engine.INFO_SCORE | chess.engine.INFO_PV,
+    played_info = next(
+        (line for line in best_lines if line.get("pv", [None])[0] == move), None
     )
+    if played_info is None:
+        played_info = engine.analyse(
+            board, limit, root_moves=[move],
+            info=chess.engine.INFO_SCORE | chess.engine.INFO_PV,
+        )
     return classify_move(
         board, move, best_lines[0], played_info,
         best_lines[1] if len(best_lines) > 1 else None,
