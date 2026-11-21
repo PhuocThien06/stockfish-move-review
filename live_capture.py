@@ -348,9 +348,7 @@ def align_board(image: Image.Image, box: tuple[int, int, int, int],
     left, top, right, bottom = box
     width, height = right - left, bottom - top
     valid: list[tuple[float, tuple[int, int, int, int], chess.Board, Image.Image]] = []
-    initial: list[tuple[float, tuple[int, int, int, int], chess.Board, Image.Image]] = []
     last_error = "Không nhận được bàn cờ từ vùng đã chọn."
-    start = chess.Board()
     for fraction in (0, .005, .01, .015, .02, .025):
         dx, dy = round(width * fraction), round(height * fraction)
         candidate = (left + dx, top + dy, right - dx, bottom - dy)
@@ -374,22 +372,21 @@ def align_board(image: Image.Image, box: tuple[int, int, int, int],
             last_error = str(exc)
         else:
             valid.append((greedy_cost, candidate, board, cropped))
-        if turn == chess.WHITE:
-            middle_empty = sum(min(costs[square], key=costs[square].get) == "."
-                               for square in chess.SQUARES
-                               if 2 <= chess.square_rank(square) <= 5)
-            start_cost = sum(costs[square][start.piece_at(square).symbol()
-                                            if start.piece_at(square) else "."]
-                             for square in chess.SQUARES)
-            if (middle_empty >= 30 and start_cost <= 900
-                    and start_cost - greedy_cost <= max(25, greedy_cost * .07)):
-                initial.append((start_cost, candidate, start.copy(), cropped))
-    if initial:
-        _, candidate, board, cropped = min(initial, key=lambda item: item[0])
-        return candidate, board, cropped
     if valid:
-        _, candidate, board, cropped = min(valid, key=lambda item: item[0])
-        return candidate, board, cropped
+        groups = {}
+        for item in valid:
+            groups.setdefault(item[2].board_fen(), []).append(item)
+        if len(groups) > 1:
+            ordered = sorted(groups.values(), key=len, reverse=True)
+            if len(ordered[0]) * 2 <= len(valid):
+                last_error = ("Ảnh chưa rõ: các vùng cắt cho ra vị trí quân khác nhau. "
+                              "Hãy khoanh lại sát bàn cờ.")
+                valid = []
+            else:
+                valid = ordered[0]
+        if valid:
+            _, candidate, board, cropped = min(valid, key=lambda item: item[0])
+            return candidate, board, cropped
     # A hand-drawn selection can have a few extra pixels on one side. Search
     # nearby square crops, rank them by where the 8x8 color grid actually lies,
     # then use contrast-tolerant piece matching for small boards.
@@ -421,6 +418,7 @@ def align_board(image: Image.Image, box: tuple[int, int, int, int],
                      if (0 < candidate[0] < candidate[2] < image.width
                          and 0 < candidate[1] < candidate[3] < image.height)),
                     reverse=True)
+    confirmed = {}
     for score, candidate in ranked[:36]:
         if score < 30:
             break
@@ -430,7 +428,14 @@ def align_board(image: Image.Image, box: tuple[int, int, int, int],
         except ValueError as exc:
             last_error = str(exc)
         else:
+            confirmed.setdefault(board.board_fen(), []).append((score, candidate, board, cropped))
+    if confirmed:
+        groups = sorted(confirmed.values(), key=len, reverse=True)
+        if len(groups[0]) >= 2 and len(groups[0]) * 2 > sum(map(len, groups)):
+            _, candidate, board, cropped = max(groups[0], key=lambda item: item[0])
             return candidate, board, cropped
+        raise ValueError("Ảnh chưa đủ rõ để xác nhận vị trí từng quân. "
+                         "Hãy khoanh lại sát bàn cờ hoặc phóng to bàn cờ trên màn hình.")
     raise ValueError(last_error)
 
 
@@ -617,7 +622,7 @@ class LiveBoardTracker:
                     self.unmatched_frames = 0
                 else:
                     self.last_unmatched = current
-                    self.unmatched_frames += 1
+                    self.unmatched_frames = 1
                 return []
         visible = set(chess.SQUARES) - annotations
 
@@ -672,5 +677,5 @@ class LiveBoardTracker:
             self.unmatched_frames = 0
         else:
             self.last_unmatched = current
-            self.unmatched_frames += 1
+            self.unmatched_frames = 1
         return []

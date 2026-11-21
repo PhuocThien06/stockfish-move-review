@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import tkinter as tk
 from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -275,7 +276,9 @@ class ChessReviewApp:
         self.live_stream: WindowCaptureStream | None = None
         self.live_window: int | None = None
         self.live_region: tuple[int, int, int, int] | None = None
+        self.live_selection_region: tuple[int, int, int, int] | None = None
         self.live_job: str | None = None
+        self.live_recovery_after = 0.0
         self.live_game_path: Path | None = None
         self.live_window_title = ""
         self.full = False
@@ -549,7 +552,7 @@ class ChessReviewApp:
         if not windows:
             messagebox.showerror("Không tìm thấy cửa sổ", "Hãy mở cửa sổ có bàn cờ rồi thử lại.")
             return
-        from PIL import ImageChops, ImageStat, ImageTk
+        from PIL import Image, ImageChops, ImageDraw, ImageStat, ImageTk
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Chọn cửa sổ và vùng bàn cờ")
@@ -572,7 +575,8 @@ class ChessReviewApp:
         state: dict = {"image": None, "photo": None, "scale": 1.0,
                        "start": None, "box": None, "rectangle": None,
                        "stream": None, "hwnd": None, "begin_frame": None,
-                       "begin_retries": 0, "starting": False}
+                       "begin_retries": 0, "starting": False,
+                       "recognized_photo": None, "recognized_fen": None}
 
         def cancel() -> None:
             if state["stream"] is not None:
@@ -602,7 +606,8 @@ class ChessReviewApp:
                 photo = ImageTk.PhotoImage(display)
                 state.update({"image": source, "photo": photo, "scale": factor,
                               "start": None, "box": None, "rectangle": None,
-                              "begin_frame": None})
+                              "begin_frame": None, "recognized_photo": None,
+                              "recognized_fen": None})
                 preview.delete("all")
                 preview.create_image(0, 0, image=photo, anchor="nw")
                 status.set("Kéo một hình vuông sát mép bàn cờ; không lấy đồng hồ hoặc danh sách nước.")
@@ -638,7 +643,7 @@ class ChessReviewApp:
                 return
             state["box"] = box
             state["begin_frame"] = None
-            status.set("Đã chọn bàn cờ. Kiểm tra lượt hiện tại rồi bấm Bắt đầu theo dõi.")
+            preview_position()
 
         preview.bind("<ButtonPress-1>", press)
         preview.bind("<B1-Motion>", drag)
@@ -653,6 +658,87 @@ class ChessReviewApp:
                                       width=9, state="readonly")
         turn_selection.current(0)
         turn_selection.pack(side="left")
+
+        def read_position(source: Image.Image, box: tuple[int, int, int, int],
+                          *, need_turn: bool) -> tuple[tuple[int, int, int, int], chess.Board, Image.Image]:
+            selected_turn = turn_selection.current()
+            if selected_turn:
+                return align_board(source, box, flipped.get(), selected_turn == 1)
+            try:
+                aligned, board, cropped = align_board(source, box, flipped.get(), chess.WHITE)
+            except ValueError:
+                aligned, board, cropped = align_board(source, box, flipped.get(), chess.BLACK)
+            inferred = infer_turn(cropped, board, flipped.get())
+            if inferred is None:
+                if need_turn:
+                    raise ValueError("Không xác định được lượt đi từ ảnh. "
+                                     "Hãy chọn Trắng hoặc Đen ở mục Lượt hiện tại.")
+            else:
+                board.turn = inferred
+                if not board.is_valid():
+                    raise ValueError("Lượt đi suy ra không hợp lệ; hãy chọn thủ công.")
+            return aligned, board, cropped
+
+        def draw_recognized(board: chess.Board, aligned: tuple[int, int, int, int]) -> None:
+            size = 32
+            miniature = Image.new("RGB", (size * 8, size * 8))
+            draw = ImageDraw.Draw(miniature)
+            for row in range(8):
+                for col in range(8):
+                    file_ = 7 - col if flipped.get() else col
+                    rank_ = row if flipped.get() else 7 - row
+                    square = chess.square(file_, rank_)
+                    color = "#f0d9b5" if (file_ + rank_) % 2 else "#b58863"
+                    x, y = col * size, row * size
+                    draw.rectangle((x, y, x + size - 1, y + size - 1), fill=color)
+                    piece = board.piece_at(square)
+                    if piece is not None:
+                        name = f"{'w' if piece.color else 'b'}{piece.symbol().upper()}.png"
+                        with Image.open(APP_HOME / "pieces" / name) as source_piece:
+                            sprite = source_piece.convert("RGBA").resize((size, size))
+                        miniature.paste(sprite, (x, y), sprite)
+            photo = ImageTk.PhotoImage(miniature)
+            state["recognized_photo"] = photo
+            preview.delete("recognized_preview")
+            factor = state["scale"]
+            x0, y0, x1, _ = (value * factor for value in aligned)
+            available_width = preview.winfo_width()
+            if x1 + 280 <= available_width:
+                panel_x = round(x1 + 10)
+            elif x0 >= 280:
+                panel_x = round(x0 - 274)
+            else:
+                panel_x = max(4, available_width - 276)
+            panel_y = max(4, min(round(y0), preview.winfo_height() - 292))
+            preview.create_rectangle(panel_x, panel_y, panel_x + 272, panel_y + 288,
+                                     fill="#211f1c", outline="#81b64c", width=2,
+                                     tags="recognized_preview")
+            preview.create_text(panel_x + 8, panel_y + 13, anchor="w",
+                                text=f"Vị trí đã nhận · {len(board.piece_map())} quân",
+                                fill="#f5f2eb", font=("Segoe UI", 10, "bold"),
+                                tags="recognized_preview")
+            preview.create_image(panel_x + 8, panel_y + 26, image=photo, anchor="nw",
+                                 tags="recognized_preview")
+
+        def preview_position() -> None:
+            if state["image"] is None or state["box"] is None:
+                return
+            try:
+                aligned, board, _ = read_position(state["image"], state["box"],
+                                                  need_turn=False)
+            except ValueError as exc:
+                state["recognized_fen"] = None
+                preview.delete("recognized_preview")
+                status.set(f"Chưa đọc rõ bàn cờ: {exc}")
+                return
+            state["recognized_fen"] = board.board_fen()
+            factor = state["scale"]
+            preview.coords(state["rectangle"], *(value * factor for value in aligned))
+            draw_recognized(board, aligned)
+            status.set("So vị trí đã nhận với bàn gốc; chọn đúng lượt đi rồi bấm Bắt đầu theo dõi.")
+
+        flipped.trace_add("write", lambda *_args: preview_position())
+        turn_selection.bind("<<ComboboxSelected>>", lambda _event: preview_position())
 
         def begin() -> None:
             if not dialog.winfo_exists():
@@ -686,39 +772,36 @@ class ChessReviewApp:
                         dialog.after(180, begin)
                         return
                     raise ValueError("Bàn cờ đang thay đổi liên tục. Hãy đợi nước đi hoàn tất rồi thử lại.")
-                selected_turn = turn_selection.current()
-                if selected_turn:
-                    box, starting_board, first_frame = align_board(
-                        source, box, flipped.get(), selected_turn == 1,
-                    )
-                else:
-                    try:
-                        box, starting_board, first_frame = align_board(
-                            source, box, flipped.get(), chess.WHITE,
-                        )
-                    except ValueError:
-                        box, starting_board, first_frame = align_board(
-                            source, box, flipped.get(), chess.BLACK,
-                        )
-                    inferred = infer_turn(first_frame, starting_board, flipped.get())
-                    if inferred is None:
-                        raise ValueError("Không xác định được lượt đi từ ảnh. "
-                                         "Hãy chọn Trắng hoặc Đen ở mục Lượt hiện tại.")
-                    starting_board.turn = inferred
-                    if not starting_board.is_valid():
-                        raise ValueError("Lượt đi suy ra không hợp lệ; hãy chọn thủ công.")
+                box, starting_board, first_frame = read_position(source, box, need_turn=True)
             except (OSError, ValueError, TimeoutError) as exc:
                 state["starting"] = False
                 state["begin_frame"] = None
                 begin_button.configure(state="normal")
                 status.set(f"Không đọc được bàn cờ: {exc}")
                 return
+            if (state["recognized_fen"] is not None
+                    and starting_board.board_fen() != state["recognized_fen"]):
+                factor = state["scale"]
+                display = reduce_glare(source.resize((round(source.width * factor),
+                                                      round(source.height * factor))))
+                photo = ImageTk.PhotoImage(display)
+                state.update({"image": source, "photo": photo,
+                              "begin_frame": None, "starting": False,
+                              "recognized_fen": starting_board.board_fen()})
+                preview.delete("all")
+                preview.create_image(0, 0, image=photo, anchor="nw")
+                state["rectangle"] = preview.create_rectangle(
+                    *(value * factor for value in box), outline="#f8b831", width=3)
+                draw_recognized(starting_board, box)
+                begin_button.configure(state="normal")
+                status.set("Bàn cờ đã đổi từ lúc xem trước. Kiểm tra vị trí mới rồi bấm lại.")
+                return
             stream.drain(128)
             state["stream"] = None
             dialog.grab_release()
             dialog.destroy()
             self._begin_live_capture(hwnd, title, box, flipped.get(), first_frame,
-                                     stream, starting_board)
+                                     stream, starting_board, selected_box=state["box"])
 
         begin_button = ttk.Button(buttons, text="Bắt đầu theo dõi", command=begin,
                                   style="Accent.TButton")
@@ -727,7 +810,8 @@ class ChessReviewApp:
     def _begin_live_capture(self, hwnd: int, title: str,
                             box: tuple[int, int, int, int], flipped: bool,
                             first_frame, stream: WindowCaptureStream,
-                            starting_board: chess.Board) -> None:
+                            starting_board: chess.Board,
+                            selected_box: tuple[int, int, int, int] | None = None) -> None:
         self._new_game()
         self.flipped = flipped
         self.positions = [starting_board]
@@ -736,6 +820,8 @@ class ChessReviewApp:
         self.live_stream = stream
         self.live_window = hwnd
         self.live_region = box
+        self.live_selection_region = selected_box or box
+        self.live_recovery_after = 0.0
         self.live_window_title = title
         self.live_game_path = GAMES_DIR / local_filename("van-theo-doi", ".pgn")
         self.manual_save_path = self.live_game_path
@@ -763,25 +849,134 @@ class ChessReviewApp:
                 self._apply_live_move(move)
                 if self.live_tracker is None:
                     return
-        except (OSError, ValueError, TimeoutError) as exc:
+                if tracker.unmatched_frames >= 50:
+                    break
+        except OSError as exc:
             self._stop_live_capture()
             self.live_status_var.set(f"Đã dừng: {exc}")
             return
-        if tracker.unmatched_frames >= 50:
-            saved_path = self.live_game_path
-            self._stop_live_capture()
-            self.live_status_var.set(
-                "Đã dừng vì ảnh bàn cờ không còn khớp nước hợp lệ (có thể đã bỏ lỡ nước). "
-                f"PGN trước đó đã lưu tại {saved_path}. Chọn lại vùng, chiều bàn và lượt đi để theo dõi tiếp."
-            )
+        except (ValueError, TimeoutError) as exc:
+            self.live_status_var.set(f"Ảnh bàn cờ tạm thời chưa đọc được: {exc}. Đang thử tiếp…")
+            if self.live_tracker is not None:
+                self.live_job = self.root.after(180, self._capture_live_tick)
+            return
+        if (tracker.unmatched_frames >= 50
+                and time.monotonic() >= self.live_recovery_after):
+            self.live_recovery_after = time.monotonic() + 2.0
+            self._recover_live_position(source)
         if self.live_tracker is not None:
             self.live_job = self.root.after(60, self._capture_live_tick)
+
+    def _recover_live_position(self, source) -> None:
+        """Rebase on a verified current board instead of ending live capture."""
+        tracker = self.live_tracker
+        selection = self.live_selection_region or self.live_region
+        if tracker is None or selection is None:
+            return
+        found = None
+        for turn in (tracker.board.turn, not tracker.board.turn):
+            try:
+                aligned, board, frame = align_board(source, selection, tracker.flipped, turn)
+            except ValueError:
+                continue
+            inferred = infer_turn(frame, board, tracker.flipped)
+            if inferred is None:
+                if board.board_fen() != self.positions[-1].board_fen():
+                    continue
+                board.turn = self.positions[-1].turn
+            else:
+                board.turn = inferred
+            if board.is_valid():
+                found = aligned, board, frame
+                break
+        if found is None:
+            self.live_status_var.set("Ảnh chưa đủ rõ hoặc chưa xác định được lượt đi; "
+                                     "vẫn đang theo dõi và sẽ thử lại khi bàn cờ ổn định.")
+            return
+        aligned, board, frame = found
+        if (board.board_fen() == self.positions[-1].board_fen()
+                and board.turn == self.positions[-1].turn):
+            self.live_region = aligned
+            self.live_tracker = LiveBoardTracker(self.positions[-1].copy(stack=True),
+                                                 tracker.flipped)
+            self.live_tracker.observe(frame)
+            self.live_status_var.set("Đã đọc lại bàn cờ; vị trí quân khớp PGN, tiếp tục theo dõi.")
+            return
+        # A clearer crop can reveal one or two moves that the earlier crop
+        # missed. Reconcile them before starting a separate PGN segment.
+        current = self.positions[-1]
+        matches: list[list[chess.Move]] = []
+        probe = current.copy(stack=False)
+        target = board.piece_map()
+        if board.turn != current.turn:
+            for move in list(probe.legal_moves):
+                probe.push(move)
+                if probe.piece_map() == target:
+                    matches.append([move])
+                probe.pop()
+        else:
+            for first in list(probe.legal_moves):
+                probe.push(first)
+                for second in list(probe.legal_moves):
+                    probe.push(second)
+                    if probe.piece_map() == target:
+                        matches.append([first, second])
+                    probe.pop()
+                probe.pop()
+        if len(matches) == 1:
+            recovered = matches[0]
+            for move in recovered:
+                self._apply_live_move(move)
+                if self.live_tracker is None:
+                    return
+            self.live_region = aligned
+            self.live_tracker = LiveBoardTracker(self.positions[-1].copy(stack=True),
+                                                 tracker.flipped)
+            self.live_tracker.observe(frame)
+            self.live_status_var.set(f"Đã khôi phục {len(recovered)} nước từ ảnh "
+                                     "và tiếp tục theo dõi trong cùng PGN.")
+            return
+        # The screenshot is reliable, but the missing plies are unknown. Keep
+        # the saved PGN intact and start a new segment from the visible FEN.
+        previous_saved = bool(self.live_game_path and self.live_game_path.is_file())
+        new_path = GAMES_DIR / local_filename("van-theo-doi-tiep", ".pgn")
+        game = chess.pgn.Game.from_board(board)
+        name = self.username_var.get().strip() or "Bạn"
+        game.headers["White"] = "Đối thủ" if tracker.flipped else name
+        game.headers["Black"] = name if tracker.flipped else "Đối thủ"
+        game.headers["Event"] = "Theo dõi tiếp từ vị trí đã chụp"
+        try:
+            GAMES_DIR.mkdir(parents=True, exist_ok=True)
+            temporary = new_path.with_suffix(".part")
+            temporary.write_text(str(game) + "\n", encoding="utf-8")
+            temporary.replace(new_path)
+        except OSError as exc:
+            self.live_status_var.set(f"Không lưu được vị trí để theo dõi tiếp: {exc}")
+            return
+        self._reset_analysis_cache(reset_bar=True)
+        self._clear_annotations()
+        self.live_region = aligned
+        self.live_game_path = new_path
+        self.manual_save_path = new_path
+        self.current_game_path = new_path
+        self.current_game = game
+        self.moves = []
+        self.positions = [board]
+        self.ply = 0
+        self.live_tracker = LiveBoardTracker(board.copy(stack=True), tracker.flipped)
+        self.live_tracker.observe(frame)
+        self._update_favorite_button()
+        self._fill_moves()
+        self._refresh()
+        prefix = "Đã giữ PGN trước" if previous_saved else "Đã bắt đầu PGN mới"
+        self.live_status_var.set(f"{prefix} và tiếp tục từ vị trí hiện tại; "
+                                 "những nước bị bỏ lỡ không được tự đoán.")
 
     def _apply_live_move(self, move: chess.Move) -> None:
         current = self.positions[-1]
         if move not in current.legal_moves:
-            self._stop_live_capture()
-            self.live_status_var.set("Vị trí trên màn hình không khớp PGN đã ghi; hãy chọn lại vùng bàn cờ.")
+            self.live_tracker.unmatched_frames = 50
+            self.live_status_var.set("Vị trí trên màn hình khác PGN; đang đọc lại bàn cờ…")
             return
         following = current.copy(stack=True)
         following.push(move)
@@ -827,6 +1022,8 @@ class ChessReviewApp:
             self.live_stream = None
         self.live_window = None
         self.live_region = None
+        self.live_selection_region = None
+        self.live_recovery_after = 0.0
         self.live_button.configure(text="Theo dõi bàn cờ trên màn hình…")
         self.move_entry.configure(state="normal")
         self.play_button.configure(state="normal")

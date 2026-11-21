@@ -227,6 +227,21 @@ class LiveCaptureTests(unittest.TestCase):
         self.assertEqual([], tracker.observe(final, now=0))
         self.assertEqual([first, second], tracker.observe(final, now=.4))
 
+    def test_unmatched_counter_counts_stable_frames_only(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board))
+        for san in ("e4", "e5", "Nf3"):
+            board.push_san(san)
+        first = render(board)
+        tracker.observe(first, now=0)
+        self.assertEqual(1, tracker.unmatched_frames)
+        tracker.observe(first, now=.1)
+        self.assertEqual(2, tracker.unmatched_frames)
+        board.push_san("Nc6")
+        tracker.observe(render(board), now=.2)
+        self.assertEqual(1, tracker.unmatched_frames)
+
     def test_queued_premove_is_recorded_only_after_opponent_moves(self) -> None:
         board = chess.Board()
         previous = board.push_san("e4")
@@ -347,8 +362,8 @@ class LiveCaptureTests(unittest.TestCase):
                          confirm(tracker, render(board, light="#ffffff", dark="#ffdda3")))
 
     def test_aligns_selected_border_at_start_and_midgame(self) -> None:
-        board = chess.Board()
-        for opening in ((), ("e4", "e5", "Nf3")):
+        for opening in ((), ("e4",), ("e4", "e5", "Nf3")):
+            board = chess.Board()
             for san in opening:
                 board.push_san(san)
             framed = Image.new("RGB", (526, 526), "#deb230")
