@@ -756,15 +756,13 @@ class ChessReviewApp:
         try:
             if self.live_stream.closed:
                 raise OSError("Cửa sổ nguồn đã đóng.")
-            frames = self.live_stream.drain()
-            if not frames and (tracker.unmatched_frames or tracker.pending_moves):
-                frames = [self.live_stream.latest()]
-            for source in frames:
-                frame = board_crop(source, self.live_region)
-                for move in tracker.observe(frame):
-                    self._apply_live_move(move)
-                    if self.live_tracker is None:
-                        return
+            frames = self.live_stream.drain(128)
+            source = frames[-1] if frames else self.live_stream.latest()
+            frame = board_crop(source, self.live_region)
+            for move in tracker.observe(frame):
+                self._apply_live_move(move)
+                if self.live_tracker is None:
+                    return
         except (OSError, ValueError, TimeoutError) as exc:
             self._stop_live_capture()
             self.live_status_var.set(f"Đã dừng: {exc}")

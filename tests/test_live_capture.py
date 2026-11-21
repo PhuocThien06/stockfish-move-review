@@ -6,7 +6,8 @@ import unittest
 import chess
 from PIL import Image, ImageDraw
 
-from live_capture import LiveBoardTracker, align_board, infer_turn, recognize_board
+from live_capture import (LiveBoardTracker, _highlighted_squares, align_board,
+                          infer_turn, recognize_board)
 
 
 PIECES = Path(__file__).resolve().parents[1] / "pieces"
@@ -41,7 +42,82 @@ def render(board: chess.Board, flipped: bool = False,
     return image
 
 
+def annotate(image: Image.Image, red: tuple[int, ...] = (),
+             arrows: tuple[tuple[int, int], ...] = ()) -> Image.Image:
+    """Approximate the translucent red squares and gold arrows on Chess.com."""
+    result = image.convert("RGBA")
+    overlay = Image.new("RGBA", result.size)
+    draw = ImageDraw.Draw(overlay)
+    for square in red:
+        x = chess.square_file(square) * 64
+        y = (7 - chess.square_rank(square)) * 64
+        draw.rectangle((x, y, x + 63, y + 63), fill=(235, 55, 45, 135))
+    for start, end in arrows:
+        x1, y1 = chess.square_file(start) * 64 + 32, (7 - chess.square_rank(start)) * 64 + 32
+        x2, y2 = chess.square_file(end) * 64 + 32, (7 - chess.square_rank(end)) * 64 + 32
+        draw.line((x1, y1, x2, y2), fill=(245, 170, 25, 220), width=14)
+    return Image.alpha_composite(result, overlay).convert("RGB")
+
+
 class LiveCaptureTests(unittest.TestCase):
+    def test_right_click_annotations_do_not_record_moves_or_stop_tracking(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board))
+        frame = annotate(render(board), red=(chess.E4, chess.E5),
+                         arrows=((chess.G1, chess.F3), (chess.D2, chess.D4)))
+        for index in range(60):
+            self.assertEqual([], tracker.observe(frame, now=index * .1))
+        self.assertEqual(0, tracker.unmatched_frames)
+        self.assertEqual(board.fen(), tracker.board.fen())
+        self.assertIsNone(_highlighted_squares(frame, False))
+        move = board.push_san("e4")
+        clean = render(board, highlights=(move.from_square, move.to_square))
+        self.assertEqual([move], confirm(tracker, clean))
+
+    def test_red_markers_do_not_override_last_move_highlights(self) -> None:
+        board = chess.Board()
+        move = board.push_san("e4")
+        frame = annotate(render(board, highlights=(move.from_square, move.to_square)),
+                         red=(chess.B3, chess.C4))
+        self.assertEqual({move.from_square, move.to_square},
+                         _highlighted_squares(frame, False))
+        self.assertEqual(chess.BLACK, infer_turn(frame, board, False))
+
+    def test_marks_on_move_squares_are_not_a_fake_move(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board))
+        marked = annotate(render(board), red=(chess.E2, chess.E4),
+                          arrows=((chess.E2, chess.E4),))
+        for index in range(8):
+            self.assertEqual([], tracker.observe(marked, now=index * .2))
+        self.assertEqual(board.fen(), tracker.board.fen())
+        move = board.push_san("e4")
+        self.assertEqual([move], tracker.observe(render(board), now=2.0)
+                         + tracker.observe(render(board), now=2.6))
+
+    def test_move_with_persistent_annotations_still_records(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        before = annotate(render(board), red=(chess.B3,),
+                          arrows=((chess.G1, chess.F3),))
+        tracker.observe(before)
+        move = board.push_san("e4")
+        after = annotate(render(board), red=(chess.B3,),
+                         arrows=((chess.G1, chess.F3),))
+        self.assertEqual([move], confirm(tracker, after))
+
+    def test_move_under_persistent_red_square_and_arrow_still_records(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        arrows = ((chess.E2, chess.E4), (chess.G1, chess.F3))
+        before = annotate(render(board), red=(chess.E2, chess.E4), arrows=arrows)
+        tracker.observe(before)
+        move = board.push_san("e4")
+        after = annotate(render(board), red=(chess.E2, chess.E4), arrows=arrows)
+        self.assertEqual([move], confirm(tracker, after))
+
     def test_tracks_both_sides_and_castling(self) -> None:
         board = chess.Board()
         tracker = LiveBoardTracker(board.copy(stack=True), False)
@@ -125,6 +201,31 @@ class LiveCaptureTests(unittest.TestCase):
         initial.push(second)
         self.assertEqual([first, second], confirm(tracker, render(initial)))
         self.assertEqual(initial.fen(), tracker.board.fen())
+
+    def test_two_fast_replay_clicks_skip_transient_animation(self) -> None:
+        initial = chess.Board()
+        tracker = LiveBoardTracker(initial.copy(), False)
+        tracker.observe(render(initial))
+        transient = initial.copy()
+        transient.push_san("e3")
+        self.assertEqual([], tracker.observe(render(transient), now=0))
+        first = initial.push_san("e4")
+        second = initial.push_san("e5")
+        final = render(initial, highlights=(second.from_square, second.to_square))
+        self.assertEqual([], tracker.observe(final, now=.08))
+        self.assertEqual([first, second], tracker.observe(final, now=.4))
+
+    def test_two_fast_replay_clicks_with_right_click_marks(self) -> None:
+        board = chess.Board()
+        tracker = LiveBoardTracker(board.copy(), False)
+        marks = dict(red=(chess.B3,), arrows=((chess.B1, chess.C3),))
+        tracker.observe(annotate(render(board), **marks))
+        first = board.push_san("e4")
+        second = board.push_san("e5")
+        final = annotate(render(board, highlights=(second.from_square,
+                                                   second.to_square)), **marks)
+        self.assertEqual([], tracker.observe(final, now=0))
+        self.assertEqual([first, second], tracker.observe(final, now=.4))
 
     def test_does_not_record_pawn_on_intermediate_animation_square(self) -> None:
         initial = chess.Board()

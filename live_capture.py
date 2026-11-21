@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from statistics import median
@@ -267,9 +267,37 @@ def _highlighted_squares(image: Image.Image, flipped: bool) -> set[int] | None:
             square = chess.square(file_, rank)
             base = backgrounds[(file_ + rank) % 2 == 0]
             pixel = frame.getpixel((col * 64 + 4, row * 64 + 4))
-            if sum(abs(pixel[channel] - base[channel]) for channel in range(3)) >= 40:
+            # Chess.com uses yellow-green for the previous move. Right-click
+            # red squares also change this corner pixel, but shift green away
+            # from red in the opposite direction. Do not mistake those marks
+            # for the last move (or for a clue about whose turn it is).
+            if (sum(abs(pixel[channel] - base[channel]) for channel in range(3)) >= 40
+                    and (pixel[1] - pixel[0]) - (base[1] - base[0]) >= 8
+                    and pixel[1] > pixel[2]):
                 marked.add(square)
     return marked if len(marked) == 2 else None
+
+
+def _annotation_squares(image: Image.Image, flipped: bool) -> set[int]:
+    """Locate right-click red fills and gold arrows, separate from move marks."""
+    frame = image.resize((512, 512), Image.Resampling.BILINEAR).convert("RGB")
+    pixels = frame.load()
+    marked = set()
+    for row in range(8):
+        for col in range(8):
+            count = 0
+            for y in range(row * 64 + 8, row * 64 + 60, 4):
+                for x in range(col * 64 + 8, col * 64 + 60, 4):
+                    red, green, blue = pixels[x, y]
+                    red_marker = red - green > 65 and red - blue > 75 and green - blue < 90
+                    gold_arrow = red - green > 45 and green - blue > 65 and red - blue > 110
+                    if red_marker or gold_arrow:
+                        count += 1
+            if count >= 8:
+                file_ = 7 - col if flipped else col
+                rank = row if flipped else 7 - row
+                marked.add(chess.square(file_, rank))
+    return marked
 
 
 def infer_turn(image: Image.Image, board: chess.Board,
@@ -305,6 +333,7 @@ class LiveBoardTracker:
     board: chess.Board
     flipped: bool
     reference: list[bytes] | None = None
+    reference_annotations: set[int] = field(default_factory=set)
     unmatched_frames: int = 0
     last_unmatched: list[bytes] | None = None
     pending_signature: list[bytes] | None = None
@@ -325,8 +354,10 @@ class LiveBoardTracker:
     def observe(self, image: Image.Image, now: float | None = None) -> list[chess.Move]:
         now = time.monotonic() if now is None else now
         current = _signature(image, self.flipped)
+        annotations = _annotation_squares(image, self.flipped)
         if self.reference is None:
             self.reference = current
+            self.reference_annotations = annotations
             return []
         if self.pending_signature is not None:
             if max(_difference(a, b) for a, b in zip(self.pending_signature, current)) < 2.5:
@@ -335,6 +366,7 @@ class LiveBoardTracker:
                     for move in moves:
                         self.board.push(move)
                     self.reference = current
+                    self.reference_annotations = annotations
                     self.pending_signature = None
                     self.pending_moves = None
                     self.unmatched_frames = 0
@@ -344,7 +376,8 @@ class LiveBoardTracker:
             self.pending_signature = None
             self.pending_moves = None
         changes = [_difference(a, b) for a, b in zip(self.reference, current)]
-        if max(changes) < 7:
+        stable_annotations = bool(annotations) and annotations == self.reference_annotations
+        if max(changes) < (4 if stable_annotations else 7):
             self.unmatched_frames = 0
             return []
         if self.last_unmatched is not None and max(
@@ -361,7 +394,9 @@ class LiveBoardTracker:
                 continue
             seen.add(endpoints)
             changed = _changed_squares(self.board, move)
-            if min(changes[move.from_square], changes[move.to_square]) < 8:
+            marked_move = stable_annotations and bool(
+                {move.from_square, move.to_square} & annotations)
+            if min(changes[move.from_square], changes[move.to_square]) < (4 if marked_move else 8):
                 continue
             signal = sum(changes[square] for square in changed)
             spill = sum(sorted((amount for square, amount in enumerate(changes)
@@ -371,7 +406,8 @@ class LiveBoardTracker:
         highlighted = _highlighted_squares(image, self.flipped)
         if candidates:
             best_score, move, expected = candidates[0]
-            if (best_score >= 22
+            marked_move = stable_annotations and bool(expected & annotations)
+            if (best_score >= (10 if marked_move else 22)
                     and (len(candidates) == 1 or best_score - candidates[1][0] >= 4)
                     and sum(amount for square, amount in enumerate(changes)
                             if square not in expected and amount > 8)
@@ -385,14 +421,37 @@ class LiveBoardTracker:
         try:
             target = recognize_board(image, self.flipped, self.board.turn).piece_map()
         except ValueError:
-            self.last_unmatched = current
-            self.unmatched_frames += 1
+            # An arrow across a piece can make its sprite temporarily
+            # unrecognizable. Keep the known position until a clear frame.
+            if annotations:
+                self.last_unmatched = None
+                self.unmatched_frames = 0
+            else:
+                self.last_unmatched = current
+                self.unmatched_frames += 1
             return []
         if target == self.board.piece_map():
-            self.reference = current
+            # A drawing is not a new board baseline: when it is cleared by a
+            # left click, that visual change must not compete with the move.
+            if not annotations:
+                self.reference = current
+                self.reference_annotations = annotations
             self.unmatched_frames = 0
             self.last_unmatched = None
             return []
+        # Colored drawings can make the signature-based score too noisy, but
+        # piece placement still gives an unambiguous legal move when readable.
+        singles = []
+        probe = self.board.copy(stack=False)
+        for move in list(probe.legal_moves):
+            probe.push(move)
+            if probe.piece_map() == target:
+                singles.append(move)
+            probe.pop()
+        if len(singles) == 1:
+            move = singles[0]
+            if highlighted is None or highlighted == {move.from_square, move.to_square}:
+                return self._hold([move], current, now, highlighted)
         matches: list[tuple[chess.Move, chess.Move]] = []
         probe = self.board.copy(stack=False)
         for first in list(probe.legal_moves):
@@ -408,6 +467,10 @@ class LiveBoardTracker:
             if (highlighted is None or highlighted
                     == {pair[-1].from_square, pair[-1].to_square}):
                 return self._hold(pair, current, now, highlighted)
-        self.last_unmatched = current
-        self.unmatched_frames += 1
+        if annotations:
+            self.last_unmatched = None
+            self.unmatched_frames = 0
+        else:
+            self.last_unmatched = current
+            self.unmatched_frames += 1
         return []
