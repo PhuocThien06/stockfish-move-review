@@ -357,6 +357,17 @@ class LiveCaptureTests(unittest.TestCase):
             self.assertEqual(board.board_fen(), found.board_fen())
             self.assertTrue(4 <= box[0] <= 10)
 
+    def test_aligns_small_flipped_midgame_with_arrow_and_uneven_border(self) -> None:
+        board = chess.Board("r4rk1/1Q3pbp/4n1p1/4p3/4P3/2P5/PP3PPP/R4RK1 w - - 0 1")
+        frame = annotate(render(board, True, light="#e0d1b9", dark="#c6936c"),
+                         arrows=((chess.E5, chess.F4),))
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(frame.resize((392, 392), Image.Resampling.BILINEAR), (149, 221))
+        selected = (143, 219, 553, 620)
+        aligned, found, _ = align_board(source, selected, True, chess.WHITE)
+        self.assertEqual(board.board_fen(), found.board_fen())
+        self.assertNotEqual(selected, aligned)
+
     def test_alignment_does_not_invent_starting_pieces_on_empty_board(self) -> None:
         empty = render(chess.Board(None))
         with self.assertRaises(ValueError):

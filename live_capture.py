@@ -203,16 +203,66 @@ def _tinted_piece(signature: bytes, templates: dict[str, bytes]) -> str:
     return scores[0][1]
 
 
-def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> chess.Board:
+def _robust_piece(signature: bytes, templates: dict[str, bytes],
+                  cell: Image.Image) -> str:
+    """Match a small sprite while ignoring pixels covered by a gold arrow."""
+    rgb = cell.convert("RGB").crop((6, 6, 58, 58)).resize((26, 26)).tobytes()
+    keep = []
+    for offset in range(0, len(rgb), 3):
+        red, green, blue = rgb[offset:offset + 3]
+        keep.append(not (red - green > 45 and green - blue > 65
+                         and red - blue > 110))
+    if sum(keep) < 300:
+        raise ValueError("Mũi tên che gần hết ô cờ.")
+    observed = [value - 128 for value, visible in zip(signature, keep) if visible]
+    scores = []
+    for symbol, sample in templates.items():
+        pattern = [value - 128 for value, visible in zip(sample, keep) if visible]
+        denominator = sum(value * value for value in pattern)
+        scale = (sum(a * b for a, b in zip(observed, pattern)) / denominator
+                 if denominator else 0.0)
+        if denominator and not .2 <= scale <= 1.5:
+            continue
+        distance = sum(abs(a - scale * b) for a, b in zip(observed, pattern)) / len(observed)
+        scores.append((distance, symbol))
+    scores.sort()
+    if len(scores) == 1 and scores[0][1] == "." and scores[0][0] < 3:
+        return "."
+    if len(scores) < 2:
+        raise ValueError("Không nhận rõ quân trên ảnh nhỏ.")
+    (distance, symbol), (second, runner_up) = scores[:2]
+    min_margin = .7 if symbol != "." and runner_up == "." and distance < 10 else 1.5
+    if distance > 24 or second - distance < min_margin:
+        raise ValueError("Không nhận rõ quân trên ảnh nhỏ.")
+    return symbol
+
+
+def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color,
+                    *, robust: bool = False) -> chess.Board:
     """Read a Neo board from a captured image; fail on ambiguous squares."""
     backgrounds = _square_backgrounds(image, flipped)
     templates = _piece_templates(*backgrounds)
     red_fills = _red_fill_squares(image, flipped)
+    frame = image.resize((512, 512), Image.Resampling.BILINEAR) if robust else None
     # White pieces can have very small margins against clipped HDR whites.
     min_margin = 0.4 if min(backgrounds[0]) >= 245 else 3
     position = chess.Board(None)
     for square, signature in enumerate(_signature(image, flipped)):
         dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
+        if robust:
+            file_ = chess.square_file(square)
+            rank_ = chess.square_rank(square)
+            col = 7 - file_ if flipped else file_
+            row = rank_ if flipped else 7 - rank_
+            cell = frame.crop((col * 64, row * 64, col * 64 + 64, row * 64 + 64))
+            try:
+                symbol = _robust_piece(signature, templates[dark], cell)
+            except ValueError as exc:
+                raise ValueError(f"Không nhận rõ quân ở ô {chess.square_name(square)}; "
+                                 "hãy khoanh sát bàn cờ và dùng bộ quân Neo.") from exc
+            if symbol != ".":
+                position.set_piece_at(square, chess.Piece.from_symbol(symbol))
+            continue
         if square in red_fills:
             symbol = _tinted_piece(signature, templates[dark])
             if symbol != ".":
@@ -241,24 +291,54 @@ def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> che
 
 
 def _visible_pieces(image: Image.Image, flipped: bool,
-                    obscured: set[int]) -> dict[int, chess.Piece]:
+                    obscured: set[int], *, robust: bool = False) -> dict[int, chess.Piece]:
     """Read clear squares when a queued premove obscures part of the board."""
     backgrounds = _square_backgrounds(image, flipped)
     templates = _piece_templates(*backgrounds)
     min_margin = 0.4 if min(backgrounds[0]) >= 245 else 3
+    frame = image.resize((512, 512), Image.Resampling.BILINEAR) if robust else None
     pieces = {}
     for square, signature in enumerate(_signature(image, flipped)):
         if square in obscured:
             continue
         dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
-        scores = sorted((_difference(signature, sample), symbol)
-                        for symbol, sample in templates[dark].items())
-        (distance, symbol), (second, _) = scores[:2]
-        if distance > 35 or second - distance < min_margin:
-            raise ValueError(f"Không nhận rõ quân ở ô {chess.square_name(square)}.")
+        if robust:
+            file_, rank_ = chess.square_file(square), chess.square_rank(square)
+            col = 7 - file_ if flipped else file_
+            row = rank_ if flipped else 7 - rank_
+            cell = frame.crop((col * 64, row * 64, col * 64 + 64, row * 64 + 64))
+            symbol = _robust_piece(signature, templates[dark], cell)
+        else:
+            scores = sorted((_difference(signature, sample), symbol)
+                            for symbol, sample in templates[dark].items())
+            (distance, symbol), (second, _) = scores[:2]
+            if distance > 35 or second - distance < min_margin:
+                raise ValueError(f"Không nhận rõ quân ở ô {chess.square_name(square)}.")
         if symbol != ".":
             pieces[square] = chess.Piece.from_symbol(symbol)
     return pieces
+
+
+def _border_alignment_score(image: Image.Image,
+                            box: tuple[int, int, int, int]) -> float:
+    """Chessboard grid lines should separate contrasting square colors."""
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    offset = max(1, round(min(width, height) / 200))
+    pixels = image.load()
+    contrasts = []
+    for line in range(1, 8):
+        for lane in range(8):
+            x = round(left + line * width / 8)
+            y = round(top + (lane + .5) * height / 8)
+            before, after = pixels[x - offset, y], pixels[x + offset, y]
+            contrasts.append(sum(abs(a - b) for a, b in zip(before[:3], after[:3])))
+            x = round(left + (lane + .5) * width / 8)
+            y = round(top + line * height / 8)
+            before, after = pixels[x, y - offset], pixels[x, y + offset]
+            contrasts.append(sum(abs(a - b) for a, b in zip(before[:3], after[:3])))
+    values = sorted(contrasts)
+    return sum(values[20:-20]) / (len(values) - 40)
 
 
 def align_board(image: Image.Image, box: tuple[int, int, int, int],
@@ -310,6 +390,47 @@ def align_board(image: Image.Image, box: tuple[int, int, int, int],
     if valid:
         _, candidate, board, cropped = min(valid, key=lambda item: item[0])
         return candidate, board, cropped
+    # A hand-drawn selection can have a few extra pixels on one side. Search
+    # nearby square crops, rank them by where the 8x8 color grid actually lies,
+    # then use contrast-tolerant piece matching for small boards.
+    image = image.convert("RGB")
+    center_x, center_y = (left + right) / 2, (top + bottom) / 2
+    options = []
+    for shrink in (0, .01, .02, .03, .04, .05):
+        size = round(min(width, height) * (1 - shrink))
+        for x_shift in (-.015, -.0075, 0, .0075, .015):
+            for y_shift in (-.015, -.0075, 0, .0075, .015):
+                x = round(center_x + x_shift * size - size / 2)
+                y = round(center_y + y_shift * size - size / 2)
+                candidate = (x, y, x + size, y + size)
+                if (x <= 0 or y <= 0 or candidate[2] >= image.width
+                        or candidate[3] >= image.height):
+                    continue
+                options.append((_border_alignment_score(image, candidate), candidate))
+    coarse = sorted(set(options), reverse=True)
+    refined = {candidate for _, candidate in coarse[:12]}
+    for _, (x, y, right, _) in coarse[:12]:
+        size = right - x
+        for dx in (-2, -1, 0, 1, 2):
+            for dy in (-2, -1, 0, 1, 2):
+                for size_change in (-2, -1, 0, 1, 2):
+                    width_ = size + size_change
+                    refined.add((x + dx, y + dy, x + dx + width_, y + dy + width_))
+    ranked = sorted(((_border_alignment_score(image, candidate), candidate)
+                     for candidate in refined
+                     if (0 < candidate[0] < candidate[2] < image.width
+                         and 0 < candidate[1] < candidate[3] < image.height)),
+                    reverse=True)
+    for score, candidate in ranked[:36]:
+        if score < 30:
+            break
+        try:
+            cropped = board_crop(image, candidate)
+            board = recognize_board(cropped, flipped, turn, robust=True)
+        except ValueError as exc:
+            last_error = str(exc)
+        else:
+            return candidate, board, cropped
     raise ValueError(last_error)
 
 
@@ -484,15 +605,20 @@ class LiveBoardTracker:
             target = (_visible_pieces(image, self.flipped, annotations) if annotations
                       else recognize_board(image, self.flipped, self.board.turn).piece_map())
         except ValueError:
-            # An arrow across a piece can make its sprite temporarily
-            # unrecognizable. Keep the known position until a clear frame.
-            if annotations:
-                self.last_unmatched = None
-                self.unmatched_frames = 0
-            else:
-                self.last_unmatched = current
-                self.unmatched_frames += 1
-            return []
+            try:
+                target = (_visible_pieces(image, self.flipped, annotations, robust=True)
+                          if annotations else recognize_board(
+                              image, self.flipped, self.board.turn, robust=True).piece_map())
+            except ValueError:
+                # An arrow across a piece can make its sprite temporarily
+                # unrecognizable. Keep the known position until a clear frame.
+                if annotations:
+                    self.last_unmatched = None
+                    self.unmatched_frames = 0
+                else:
+                    self.last_unmatched = current
+                    self.unmatched_frames += 1
+                return []
         visible = set(chess.SQUARES) - annotations
 
         def matches_visible(position: chess.Board) -> bool:
