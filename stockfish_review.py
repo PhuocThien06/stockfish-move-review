@@ -1419,6 +1419,10 @@ class ChessReviewApp:
         self.left_press_square = self._event_square(event)
         self.left_press_xy = (event.x, event.y)
         self.left_dragging = False
+        if self.left_press_square is not None and (self.marked_squares or self.arrows):
+            self.marked_squares.clear()
+            self.arrows.clear()
+            self._render_board()
 
     def _left_motion(self, event: tk.Event) -> None:
         start = self.left_press_square
@@ -1464,7 +1468,6 @@ class ChessReviewApp:
                 self._render_board()
             return
         if not self._can_move_board():
-            self._remove_annotations_at(target)
             self._render_board()
             return
         if self.selected_square is not None:
@@ -1476,18 +1479,10 @@ class ChessReviewApp:
             if move is not None:
                 self._play_move(move)
                 return
-        if target in self.marked_squares or any(target in arrow for arrow in self.arrows):
-            self._remove_annotations_at(target)
-            self._render_board()
-            return
         board = self.positions[self.ply]
         piece = board.piece_at(target)
         self.selected_square = target if piece and piece.color == board.turn else None
         self._render_board()
-
-    def _remove_annotations_at(self, square: int) -> None:
-        self.marked_squares.discard(square)
-        self.arrows = {arrow for arrow in self.arrows if square not in arrow}
 
     def _right_press(self, event: tk.Event) -> None:
         self.right_press_square = self._event_square(event)
