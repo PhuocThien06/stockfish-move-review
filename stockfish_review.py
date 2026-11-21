@@ -286,6 +286,7 @@ class ChessReviewApp:
         self.live_moves: list[chess.Move] | None = None
         self.live_positions: list[chess.Board] | None = None
         self.live_branch_active = False
+        self.live_flipped = False
         self.full = False
         self.flipped = False
         self.selected_square: int | None = None
@@ -823,6 +824,7 @@ class ChessReviewApp:
         self.live_positions = [starting_board]
         self.positions = self.live_positions
         self.live_branch_active = False
+        self.live_flipped = flipped
         self.live_tracker = LiveBoardTracker(starting_board.copy(stack=True), flipped)
         self.live_tracker.observe(first_frame)
         self.live_stream = stream
@@ -884,15 +886,38 @@ class ChessReviewApp:
         live_positions = self.live_positions
         found = None
 
-        def accept_position(aligned, board, frame):
-            inferred = infer_turn(frame, board, tracker.flipped)
+        def position_rank(candidate):
+            _, board, _, source_flipped = candidate
+            # A mirrored opening can still pass python-chess legality checks.
+            # Pawns on their own home rank and kings on their own back rank
+            # distinguish the real orientation before a new game's first move.
+            own_pawns = sum(
+                chess.square_rank(square) == (1 if piece.color else 6)
+                for square, piece in board.piece_map().items()
+                if piece.piece_type == chess.PAWN
+            )
+            mirrored_pawns = sum(
+                chess.square_rank(square) == (6 if piece.color else 1)
+                for square, piece in board.piece_map().items()
+                if piece.piece_type == chess.PAWN
+            )
+            own_kings = sum(
+                chess.square_rank(board.king(color)) == (0 if color else 7)
+                for color in (chess.WHITE, chess.BLACK)
+            )
+            return (board.board_fen() == live_positions[-1].board_fen(),
+                    own_pawns - mirrored_pawns + 2 * own_kings,
+                    source_flipped == tracker.flipped)
+
+        def accept_position(aligned, board, frame, source_flipped):
+            inferred = infer_turn(frame, board, source_flipped)
             if inferred is None:
                 if board.board_fen() != live_positions[-1].board_fen():
                     return None
                 board.turn = live_positions[-1].turn
             else:
                 board.turn = inferred
-            return (aligned, board, frame) if board.is_valid() else None
+            return (aligned, board, frame, source_flipped) if board.is_valid() else None
 
         # Most missed moves leave the board in the same on-screen location.
         # Reading the already-aligned region takes a fraction of a second;
@@ -903,34 +928,52 @@ class ChessReviewApp:
             except ValueError:
                 pass
             else:
+                candidates = []
+                for source_flipped in (tracker.flipped, not tracker.flipped):
+                    for turn in (tracker.board.turn, not tracker.board.turn):
+                        try:
+                            board = recognize_board(frame, source_flipped, turn, robust=True)
+                        except ValueError:
+                            continue
+                        candidate = accept_position(self.live_region, board, frame,
+                                                    source_flipped)
+                        if candidate is not None:
+                            candidates.append(candidate)
+                            break
+                if candidates:
+                    found = max(candidates, key=position_rank)
+        if found is None:
+            candidates = []
+            for source_flipped in (tracker.flipped, not tracker.flipped):
                 for turn in (tracker.board.turn, not tracker.board.turn):
                     try:
-                        board = recognize_board(frame, tracker.flipped, turn, robust=True)
+                        aligned, board, frame = align_board(source, selection,
+                                                            source_flipped, turn)
                     except ValueError:
                         continue
-                    found = accept_position(self.live_region, board, frame)
-                    if found is not None:
+                    candidate = accept_position(aligned, board, frame, source_flipped)
+                    if candidate is not None:
+                        candidates.append(candidate)
                         break
-        if found is None:
-            for turn in (tracker.board.turn, not tracker.board.turn):
-                try:
-                    aligned, board, frame = align_board(source, selection, tracker.flipped, turn)
-                except ValueError:
-                    continue
-                found = accept_position(aligned, board, frame)
-                if found is not None:
-                    break
+            if candidates:
+                found = max(candidates, key=position_rank)
         if found is None:
             self.live_status_var.set("Ảnh chưa đủ rõ hoặc chưa xác định được lượt đi; "
                                      "vẫn đang theo dõi và sẽ thử lại khi bàn cờ ổn định.")
             return
-        aligned, board, frame = found
+        aligned, board, frame, source_flipped = found
         if (board.board_fen() == live_positions[-1].board_fen()
                 and board.turn == live_positions[-1].turn):
             self.live_region = aligned
+            self.live_flipped = source_flipped
             self.live_tracker = LiveBoardTracker(live_positions[-1].copy(stack=True),
-                                                 tracker.flipped)
+                                                 source_flipped)
             self.live_tracker.observe(frame)
+            if not self.live_branch_active and self.flipped != source_flipped:
+                self.flipped = source_flipped
+                self.bar_display_share = 1 - self.bar_display_share
+                self.bar_target_share = 1 - self.bar_target_share
+                self._refresh()
             self.live_status_var.set("Đã đọc lại bàn cờ; vị trí quân khớp PGN, tiếp tục theo dõi.")
             return
         # A clearer crop can reveal one or two moves that the earlier crop
@@ -939,7 +982,9 @@ class ChessReviewApp:
         matches: list[list[chess.Move]] = []
         probe = current.copy(stack=False)
         target = board.piece_map()
-        if board.turn != current.turn:
+        if source_flipped != tracker.flipped:
+            matches = []
+        elif board.turn != current.turn:
             for move in list(probe.legal_moves):
                 probe.push(move)
                 if probe.piece_map() == target:
@@ -962,7 +1007,7 @@ class ChessReviewApp:
                     return
             self.live_region = aligned
             self.live_tracker = LiveBoardTracker(self.live_positions[-1].copy(stack=True),
-                                                 tracker.flipped)
+                                                 source_flipped)
             self.live_tracker.observe(frame)
             self.live_status_var.set(f"Đã khôi phục {len(recovered)} nước từ ảnh "
                                      "và tiếp tục theo dõi trong cùng PGN.")
@@ -973,8 +1018,8 @@ class ChessReviewApp:
         new_path = GAMES_DIR / local_filename("van-theo-doi-tiep", ".pgn")
         game = chess.pgn.Game.from_board(board)
         name = self.username_var.get().strip() or "Bạn"
-        game.headers["White"] = "Đối thủ" if tracker.flipped else name
-        game.headers["Black"] = name if tracker.flipped else "Đối thủ"
+        game.headers["White"] = "Đối thủ" if source_flipped else name
+        game.headers["Black"] = name if source_flipped else "Đối thủ"
         game.headers["Event"] = "Theo dõi tiếp từ vị trí đã chụp"
         try:
             GAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -989,16 +1034,18 @@ class ChessReviewApp:
             self._clear_annotations()
         self.live_region = aligned
         self.live_game_path = new_path
+        self.live_flipped = source_flipped
         self.live_moves = []
         self.live_positions = [board]
         if not self.live_branch_active:
+            self.flipped = source_flipped
             self.manual_save_path = new_path
             self.current_game_path = new_path
             self.current_game = game
             self.moves = self.live_moves
             self.positions = self.live_positions
             self.ply = 0
-        self.live_tracker = LiveBoardTracker(board.copy(stack=True), tracker.flipped)
+        self.live_tracker = LiveBoardTracker(board.copy(stack=True), source_flipped)
         self.live_tracker.observe(frame)
         if not self.live_branch_active:
             self._update_favorite_button()
@@ -1053,8 +1100,8 @@ class ChessReviewApp:
         self.live_status_var.set(f"Đang nhận nước đi trực tiếp · {len(self.live_moves)} nước · "
                                  f"vừa ghi {current.san(move)}")
         if following.is_game_over():
-            self._stop_live_capture()
-            self.live_status_var.set("Ván đã kết thúc; PGN đã lưu trên ổ D.")
+            self.live_status_var.set("Ván đã kết thúc; PGN đã lưu trên ổ D. "
+                                     "Đang đợi ván tiếp theo trong cửa sổ này…")
 
     def _stop_live_capture(self) -> None:
         if self.live_job is not None:
@@ -1321,6 +1368,7 @@ class ChessReviewApp:
         self.live_moves = None
         self.live_positions = None
         self.live_branch_active = False
+        self.live_flipped = False
         self._dismiss_coach_panel()
         self.current_game = game
         self.original_review_state = None
@@ -1364,6 +1412,7 @@ class ChessReviewApp:
         self.live_moves = None
         self.live_positions = None
         self.live_branch_active = False
+        self.live_flipped = False
         self._dismiss_coach_panel()
         self.user_acted = True
         self._stop_autoplay()
@@ -1887,6 +1936,7 @@ class ChessReviewApp:
         self._reset_analysis_cache(reset_bar=True)
         self._clear_annotations()
         self.live_branch_active = False
+        self.flipped = self.live_flipped
         self.moves = self.live_moves
         self.positions = self.live_positions
         self.ply = len(self.live_moves)

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import chess
+import chess.engine
 from PIL import Image
 
 import stockfish_review as review
@@ -44,6 +45,7 @@ class LiveRecoveryTests(unittest.TestCase):
         self.app.live_positions = [board.copy(stack=True)]
         self.app.positions = self.app.live_positions
         self.app.live_branch_active = False
+        self.app.live_flipped = False
         self.app.ply = 0
         self.app.live_tracker = LiveBoardTracker(board.copy(stack=True), False)
         self.app.live_tracker.observe(render(board))
@@ -152,6 +154,110 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertTrue(self.app.live_branch_active)
         self.assertEqual("d4", chess.Board().san(self.app.moves[0]))
         self.assertEqual(2, len(self.app.live_moves))
+
+    def test_new_game_switches_to_black_and_clears_previous_evaluation(self) -> None:
+        self._setup_capture(chess.Board())
+        for san in ("e4", "e5"):
+            self.app._apply_live_move(self.app.live_positions[-1].parse_san(san))
+        old_path = self.app.live_game_path
+        self.app.score_cache[2] = (chess.engine.Cp(450), 0.85)
+        self.app.bar_last_score = chess.engine.Cp(450)
+        self.app.bar_display_share = self.app.bar_target_share = 0.85
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(chess.Board(), True), (80, 80))
+
+        self.app._recover_live_position(source)
+        self.assertTrue(self.app.flipped, self.app.live_status_var.get())
+        self.assertTrue(self.app.live_tracker.flipped)
+        self.assertEqual(chess.STARTING_BOARD_FEN,
+                         self.app.positions[-1].board_fen())
+        self.assertEqual([], self.app.moves)
+        self.assertEqual({}, self.app.score_cache)
+        self.assertIsNone(self.app.bar_last_score)
+        self.assertEqual(0.5, self.app.bar_target_share)
+        self.assertEqual("0.00", self.app.eval_var.get())
+        self.assertNotEqual(old_path, self.app.live_game_path)
+        self.assertTrue(old_path.is_file())
+        self.app._draw_bar(chess.engine.Cp(-100), 0.4)
+        self.assertEqual("+1.00", self.app.eval_var.get())
+        self.assertAlmostEqual(0.6, self.app.bar_target_share)
+
+    def test_new_game_on_same_side_also_clears_previous_evaluation(self) -> None:
+        self._setup_capture(chess.Board())
+        self.app._apply_live_move(self.app.live_positions[-1].parse_san("e4"))
+        self.app.bar_last_score = chess.engine.Cp(-600)
+        self.app.bar_display_share = self.app.bar_target_share = 0.1
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(chess.Board()), (80, 80))
+
+        self.app._recover_live_position(source)
+        self.assertFalse(self.app.flipped)
+        self.assertEqual(chess.STARTING_BOARD_FEN,
+                         self.app.positions[-1].board_fen())
+        self.assertIsNone(self.app.bar_last_score)
+        self.assertEqual(0.5, self.app.bar_target_share)
+
+    def test_detects_next_game_after_its_first_move_with_opposite_color(self) -> None:
+        self._setup_capture(chess.Board())
+        for san in ("e4", "e5", "Nf3"):
+            self.app._apply_live_move(self.app.live_positions[-1].parse_san(san))
+        next_game = chess.Board()
+        last = next_game.push_san("d4")
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(next_game, True,
+                            highlights=(last.from_square, last.to_square)), (80, 80))
+
+        self.app._recover_live_position(source)
+        self.assertTrue(self.app.flipped, self.app.live_status_var.get())
+        self.assertTrue(self.app.live_tracker.flipped)
+        self.assertEqual(next_game.board_fen(),
+                         self.app.positions[-1].board_fen())
+        self.assertFalse(self.app.positions[-1].turn)
+        self.assertIsNone(self.app.bar_last_score)
+
+    def test_checkmate_keeps_window_capture_ready_for_next_game(self) -> None:
+        board = chess.Board()
+        for san in ("f3", "e5", "g4"):
+            board.push_san(san)
+        self._setup_capture(board)
+        self.app._apply_live_move(board.parse_san("Qh4#"))
+        self.assertIsNotNone(self.app.live_tracker)
+        self.assertTrue(self.app.live_positions[-1].is_checkmate())
+        self.assertTrue(self.app.live_game_path.is_file())
+        self.assertIn("Đang đợi ván tiếp theo", self.app.live_status_var.get())
+
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(chess.Board(), True), (80, 80))
+        frame = render(chess.Board(), True)
+        for index in range(review.LIVE_RECOVERY_STABLE_FRAMES):
+            self.app.live_tracker.observe(frame, now=index * .1)
+
+        class FakeStream:
+            closed = False
+
+            def drain(self, _limit: int) -> list[Image.Image]:
+                return [source]
+
+            def close(self) -> None:
+                self.closed = True
+
+        self.app.live_stream = FakeStream()
+        self.app.live_window = 1
+        self.app._capture_live_tick()
+        self.assertTrue(self.app.flipped)
+        self.assertEqual(chess.STARTING_BOARD_FEN,
+                         self.app.live_positions[-1].board_fen())
+
+    def test_live_color_change_does_not_flip_an_open_trial_branch(self) -> None:
+        self._setup_capture(chess.Board())
+        self.app._play_move(self.app.positions[-1].parse_san("d4"))
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(chess.Board(), True), (80, 80))
+        self.app._recover_live_position(source)
+        self.assertFalse(self.app.flipped)
+        self.assertTrue(self.app.live_flipped)
+        self.app._return_to_live()
+        self.assertTrue(self.app.flipped)
 
 
 if __name__ == "__main__":
