@@ -168,15 +168,56 @@ def _square_backgrounds(image: Image.Image, flipped: bool) -> tuple[tuple[int, i
                        for channel in range(3)) for dark in (False, True))
 
 
+def _red_fill_squares(image: Image.Image, flipped: bool) -> set[int]:
+    """Find filled red squares, excluding narrow gold arrows."""
+    frame = image.resize((512, 512), Image.Resampling.BILINEAR).convert("RGB")
+    marked = set()
+    for row in range(8):
+        for col in range(8):
+            red, green, blue = frame.getpixel((col * 64 + 4, row * 64 + 4))
+            if red - green > 65 and red - blue > 75 and green - blue < 90:
+                file_ = 7 - col if flipped else col
+                rank = row if flipped else 7 - row
+                marked.add(chess.square(file_, rank))
+    return marked
+
+
+def _tinted_piece(signature: bytes, templates: dict[str, bytes]) -> str:
+    """Fit reduced piece contrast under a translucent red premove fill."""
+    centered = [pixel - 128 for pixel in signature]
+    scores = []
+    for symbol, sample in templates.items():
+        pattern = [pixel - 128 for pixel in sample]
+        denominator = sum(value * value for value in pattern)
+        scale = (sum(a * b for a, b in zip(centered, pattern)) / denominator
+                 if denominator else 0.0)
+        if denominator and not .2 <= scale <= 1.5:
+            continue
+        distance = sum(abs(a - scale * b) for a, b in zip(centered, pattern)) / len(centered)
+        scores.append((distance, symbol))
+    scores.sort()
+    if len(scores) == 1 and scores[0][1] == "." and scores[0][0] < 3:
+        return "."
+    if len(scores) < 2 or scores[0][0] > 24 or scores[1][0] - scores[0][0] < 3:
+        raise ValueError("Không nhận rõ quân dưới ô premove tô đỏ.")
+    return scores[0][1]
+
+
 def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> chess.Board:
     """Read a Neo board from a captured image; fail on ambiguous squares."""
     backgrounds = _square_backgrounds(image, flipped)
     templates = _piece_templates(*backgrounds)
+    red_fills = _red_fill_squares(image, flipped)
     # White pieces can have very small margins against clipped HDR whites.
     min_margin = 0.4 if min(backgrounds[0]) >= 245 else 3
     position = chess.Board(None)
     for square, signature in enumerate(_signature(image, flipped)):
         dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
+        if square in red_fills:
+            symbol = _tinted_piece(signature, templates[dark])
+            if symbol != ".":
+                position.set_piece_at(square, chess.Piece.from_symbol(symbol))
+            continue
         scores = sorted((_difference(signature, sample), symbol)
                         for symbol, sample in templates[dark].items())
         (distance, symbol), (second, _) = scores[:2]
@@ -197,6 +238,27 @@ def recognize_board(image: Image.Image, flipped: bool, turn: chess.Color) -> che
     if not position.is_valid():
         raise ValueError("Thế cờ nhận từ ảnh không hợp lệ. Kiểm tra lượt đi, vùng bàn và chiều bàn.")
     return position
+
+
+def _visible_pieces(image: Image.Image, flipped: bool,
+                    obscured: set[int]) -> dict[int, chess.Piece]:
+    """Read clear squares when a queued premove obscures part of the board."""
+    backgrounds = _square_backgrounds(image, flipped)
+    templates = _piece_templates(*backgrounds)
+    min_margin = 0.4 if min(backgrounds[0]) >= 245 else 3
+    pieces = {}
+    for square, signature in enumerate(_signature(image, flipped)):
+        if square in obscured:
+            continue
+        dark = (chess.square_file(square) + chess.square_rank(square)) % 2 == 0
+        scores = sorted((_difference(signature, sample), symbol)
+                        for symbol, sample in templates[dark].items())
+        (distance, symbol), (second, _) = scores[:2]
+        if distance > 35 or second - distance < min_margin:
+            raise ValueError(f"Không nhận rõ quân ở ô {chess.square_name(square)}.")
+        if symbol != ".":
+            pieces[square] = chess.Piece.from_symbol(symbol)
+    return pieces
 
 
 def align_board(image: Image.Image, box: tuple[int, int, int, int],
@@ -419,7 +481,8 @@ class LiveBoardTracker:
         # Two moves may occur between captured frames. Match the visible piece
         # placement to legal pairs rather than guessing a single move.
         try:
-            target = recognize_board(image, self.flipped, self.board.turn).piece_map()
+            target = (_visible_pieces(image, self.flipped, annotations) if annotations
+                      else recognize_board(image, self.flipped, self.board.turn).piece_map())
         except ValueError:
             # An arrow across a piece can make its sprite temporarily
             # unrecognizable. Keep the known position until a clear frame.
@@ -430,7 +493,17 @@ class LiveBoardTracker:
                 self.last_unmatched = current
                 self.unmatched_frames += 1
             return []
-        if target == self.board.piece_map():
+        visible = set(chess.SQUARES) - annotations
+
+        def matches_visible(position: chess.Board) -> bool:
+            return all(position.piece_at(square) == target.get(square)
+                       for square in visible)
+
+        def move_is_visible(move: chess.Move) -> bool:
+            return not annotations or (move.from_square not in annotations
+                                       and move.to_square not in annotations)
+
+        if matches_visible(self.board):
             # A drawing is not a new board baseline: when it is cleared by a
             # left click, that visual change must not compete with the move.
             if not annotations:
@@ -445,7 +518,7 @@ class LiveBoardTracker:
         probe = self.board.copy(stack=False)
         for move in list(probe.legal_moves):
             probe.push(move)
-            if probe.piece_map() == target:
+            if move_is_visible(move) and matches_visible(probe):
                 singles.append(move)
             probe.pop()
         if len(singles) == 1:
@@ -458,7 +531,8 @@ class LiveBoardTracker:
             probe.push(first)
             for second in list(probe.legal_moves):
                 probe.push(second)
-                if probe.piece_map() == target:
+                if (move_is_visible(first) and move_is_visible(second)
+                        and matches_visible(probe)):
                     matches.append((first, second))
                 probe.pop()
             probe.pop()

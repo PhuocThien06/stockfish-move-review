@@ -227,6 +227,76 @@ class LiveCaptureTests(unittest.TestCase):
         self.assertEqual([], tracker.observe(final, now=0))
         self.assertEqual([first, second], tracker.observe(final, now=.4))
 
+    def test_queued_premove_is_recorded_only_after_opponent_moves(self) -> None:
+        board = chess.Board()
+        previous = board.push_san("e4")
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board, highlights=(previous.from_square, previous.to_square)))
+        queued = annotate(render(board, highlights=(previous.from_square,
+                                                   previous.to_square)),
+                          red=(chess.G1, chess.F3))
+        for index in range(8):
+            self.assertEqual([], tracker.observe(queued, now=index * .1))
+        self.assertEqual(board.board_fen(), tracker.board.board_fen())
+        opponent = board.push_san("e5")
+        premove = board.push_san("Nf3")
+        final = render(board, highlights=(premove.from_square, premove.to_square))
+        self.assertEqual([], tracker.observe(final, now=1.0))
+        self.assertEqual([opponent, premove], tracker.observe(final, now=1.4))
+
+    def test_can_start_capture_while_premove_is_queued(self) -> None:
+        board = chess.Board()
+        last = board.push_san("e4")
+        queued = annotate(render(board, highlights=(last.from_square,
+                                                    last.to_square)),
+                          red=(chess.G1, chess.F3))
+        recognized = recognize_board(queued, False, chess.BLACK)
+        self.assertEqual(board.board_fen(), recognized.board_fen())
+        _, aligned, _ = align_board(queued, (0, 0, 512, 512), False, chess.BLACK)
+        self.assertEqual(board.board_fen(), aligned.board_fen())
+        self.assertEqual(chess.BLACK, infer_turn(queued, aligned, False))
+
+    def test_cancelled_premove_does_not_change_position(self) -> None:
+        board = chess.Board()
+        previous = board.push_san("e4")
+        tracker = LiveBoardTracker(board.copy(), False)
+        plain = render(board, highlights=(previous.from_square, previous.to_square))
+        tracker.observe(plain)
+        queued = annotate(plain, red=(chess.G1, chess.F3))
+        self.assertEqual([], tracker.observe(queued, now=0))
+        self.assertEqual([], tracker.observe(plain, now=.5))
+        opponent = board.push_san("e5")
+        final = render(board, highlights=(opponent.from_square, opponent.to_square))
+        self.assertEqual([], tracker.observe(final, now=.6))
+        self.assertEqual([opponent], tracker.observe(final, now=1.0))
+
+    def test_next_queued_premove_does_not_hide_two_completed_moves(self) -> None:
+        board = chess.Board()
+        board.push_san("e4")
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board))
+        opponent = board.push_san("e5")
+        executed = board.push_san("Nf3")
+        # A new Bc4 premove is queued while Black thinks. Its red source
+        # square obscures a bishop; the completed e5 and Nf3 must still count.
+        final = annotate(render(board), red=(chess.F1, chess.C4))
+        self.assertEqual([], tracker.observe(final, now=0))
+        self.assertEqual([opponent, executed], tracker.observe(final, now=.6))
+
+    def test_obscured_premove_is_not_invented_from_opponent_move(self) -> None:
+        board = chess.Board()
+        board.push_san("e4")
+        tracker = LiveBoardTracker(board.copy(), False)
+        tracker.observe(render(board))
+        opponent = board.push_san("e5")
+        queued = annotate(render(board), red=(chess.G1, chess.F3))
+        self.assertEqual([], tracker.observe(queued, now=0))
+        self.assertEqual([opponent], tracker.observe(queued, now=.6))
+        executed = board.push_san("Nf3")
+        clear = render(board)
+        self.assertEqual([], tracker.observe(clear, now=.7))
+        self.assertEqual([executed], tracker.observe(clear, now=1.3))
+
     def test_does_not_record_pawn_on_intermediate_animation_square(self) -> None:
         initial = chess.Board()
         tracker = LiveBoardTracker(initial.copy(), False)
