@@ -287,6 +287,7 @@ class ChessReviewApp:
         self.live_positions: list[chess.Board] | None = None
         self.live_branch_active = False
         self.live_flipped = False
+        self.live_turn_uncertain = False
         self.full = False
         self.flipped = False
         self.selected_square: int | None = None
@@ -825,6 +826,7 @@ class ChessReviewApp:
         self.positions = self.live_positions
         self.live_branch_active = False
         self.live_flipped = flipped
+        self.live_turn_uncertain = False
         self.live_tracker = LiveBoardTracker(starting_board.copy(stack=True), flipped)
         self.live_tracker.observe(first_frame)
         self.live_stream = stream
@@ -854,6 +856,13 @@ class ChessReviewApp:
                 raise OSError("Cửa sổ nguồn đã đóng.")
             frames = self.live_stream.drain(128)
             source = frames[-1] if frames else self.live_stream.latest()
+            if self.live_turn_uncertain:
+                if time.monotonic() >= self.live_recovery_after:
+                    self.live_recovery_after = time.monotonic() + 0.7
+                    self._recover_live_position(source)
+                if self.live_tracker is not None:
+                    self.live_job = self.root.after(120, self._capture_live_tick)
+                return
             frame = board_crop(source, self.live_region)
             for move in tracker.observe(frame):
                 self._apply_live_move(move)
@@ -887,7 +896,7 @@ class ChessReviewApp:
         found = None
 
         def position_rank(candidate):
-            _, board, _, source_flipped = candidate
+            _, board, _, source_flipped, turn_known = candidate
             # A mirrored opening can still pass python-chess legality checks.
             # Pawns on their own home rank and kings on their own back rank
             # distinguish the real orientation before a new game's first move.
@@ -907,17 +916,20 @@ class ChessReviewApp:
             )
             return (board.board_fen() == live_positions[-1].board_fen(),
                     own_pawns - mirrored_pawns + 2 * own_kings,
+                    turn_known,
                     source_flipped == tracker.flipped)
 
         def accept_position(aligned, board, frame, source_flipped):
             inferred = infer_turn(frame, board, source_flipped)
+            turn_known = inferred is not None
             if inferred is None:
-                if board.board_fen() != live_positions[-1].board_fen():
-                    return None
-                board.turn = live_positions[-1].turn
+                if board.board_fen() == live_positions[-1].board_fen():
+                    board.turn = live_positions[-1].turn
+                    turn_known = not self.live_turn_uncertain
             else:
                 board.turn = inferred
-            return (aligned, board, frame, source_flipped) if board.is_valid() else None
+            return ((aligned, board, frame, source_flipped, turn_known)
+                    if board.is_valid() else None)
 
         # Most missed moves leave the board in the same on-screen location.
         # Reading the already-aligned region takes a fraction of a second;
@@ -961,20 +973,34 @@ class ChessReviewApp:
             self.live_status_var.set("Ảnh chưa đủ rõ hoặc chưa xác định được lượt đi; "
                                      "vẫn đang theo dõi và sẽ thử lại khi bàn cờ ổn định.")
             return
-        aligned, board, frame, source_flipped = found
+        aligned, board, frame, source_flipped, turn_known = found
         if (board.board_fen() == live_positions[-1].board_fen()
-                and board.turn == live_positions[-1].turn):
+                and (board.turn == live_positions[-1].turn or self.live_turn_uncertain)):
+            was_uncertain = self.live_turn_uncertain
+            if was_uncertain and turn_known:
+                live_positions[-1].turn = board.turn
+                if not self.live_branch_active:
+                    self.current_game = chess.pgn.Game.from_board(live_positions[-1])
+                    self._reset_analysis_cache(reset_bar=True)
             self.live_region = aligned
             self.live_flipped = source_flipped
+            self.live_turn_uncertain = not turn_known
             self.live_tracker = LiveBoardTracker(live_positions[-1].copy(stack=True),
                                                  source_flipped)
             self.live_tracker.observe(frame)
-            if not self.live_branch_active and self.flipped != source_flipped:
-                self.flipped = source_flipped
-                self.bar_display_share = 1 - self.bar_display_share
-                self.bar_target_share = 1 - self.bar_target_share
-                self._refresh()
-            self.live_status_var.set("Đã đọc lại bàn cờ; vị trí quân khớp PGN, tiếp tục theo dõi.")
+            if not self.live_branch_active:
+                if self.flipped != source_flipped:
+                    self.flipped = source_flipped
+                    self.bar_display_share = 1 - self.bar_display_share
+                    self.bar_target_share = 1 - self.bar_target_share
+                    self._refresh()
+                elif was_uncertain and turn_known:
+                    self._refresh()
+            self.live_status_var.set(
+                "Đã cập nhật vị trí quân; đang chờ xác định lượt đi từ ảnh."
+                if self.live_turn_uncertain else
+                "Đã đọc lại bàn cờ; vị trí quân khớp PGN, tiếp tục theo dõi."
+            )
             return
         # A clearer crop can reveal one or two moves that the earlier crop
         # missed. Reconcile them before starting a separate PGN segment.
@@ -982,7 +1008,7 @@ class ChessReviewApp:
         matches: list[list[chess.Move]] = []
         probe = current.copy(stack=False)
         target = board.piece_map()
-        if source_flipped != tracker.flipped:
+        if not turn_known or source_flipped != tracker.flipped:
             matches = []
         elif board.turn != current.turn:
             for move in list(probe.legal_moves):
@@ -1021,20 +1047,13 @@ class ChessReviewApp:
         game.headers["White"] = "Đối thủ" if source_flipped else name
         game.headers["Black"] = name if source_flipped else "Đối thủ"
         game.headers["Event"] = "Theo dõi tiếp từ vị trí đã chụp"
-        try:
-            GAMES_DIR.mkdir(parents=True, exist_ok=True)
-            temporary = new_path.with_suffix(".part")
-            temporary.write_text(str(game) + "\n", encoding="utf-8")
-            temporary.replace(new_path)
-        except OSError as exc:
-            self.live_status_var.set(f"Không lưu được vị trí để theo dõi tiếp: {exc}")
-            return
         if not self.live_branch_active:
             self._reset_analysis_cache(reset_bar=True)
             self._clear_annotations()
         self.live_region = aligned
         self.live_game_path = new_path
         self.live_flipped = source_flipped
+        self.live_turn_uncertain = not turn_known
         self.live_moves = []
         self.live_positions = [board]
         if not self.live_branch_active:
@@ -1051,12 +1070,18 @@ class ChessReviewApp:
             self._update_favorite_button()
             self._fill_moves()
             self._refresh()
-        prefix = "Đã giữ PGN trước" if previous_saved else "Đã bắt đầu PGN mới"
-        self.live_status_var.set(f"{prefix} và tiếp tục từ vị trí hiện tại; "
-                                 "những nước bị bỏ lỡ không được tự đoán.")
+        if self.live_turn_uncertain:
+            self.live_status_var.set("Đã tái tạo vị trí quân từ ảnh; "
+                                     "đang chờ xác định lượt đi trước khi lưu nước mới.")
+        else:
+            prefix = "Đã giữ PGN trước" if previous_saved else "Đã bắt đầu PGN mới"
+            self.live_status_var.set(f"{prefix} và tiếp tục từ vị trí hiện tại; "
+                                     "những nước bị bỏ lỡ không được tự đoán.")
 
     def _apply_live_move(self, move: chess.Move) -> None:
         if self.live_positions is None or self.live_moves is None:
+            return
+        if self.live_turn_uncertain:
             return
         current = self.live_positions[-1]
         if move not in current.legal_moves:
@@ -1079,6 +1104,7 @@ class ChessReviewApp:
         game.headers["Event"] = "Theo dõi bàn cờ trên màn hình"
         if not self.live_branch_active:
             self.current_game = game
+        save_error = None
         try:
             GAMES_DIR.mkdir(parents=True, exist_ok=True)
             temporary = self.live_game_path.with_suffix(".part")
@@ -1088,20 +1114,18 @@ class ChessReviewApp:
                 self.current_game_path = self.live_game_path
                 self._update_favorite_button()
         except OSError as exc:
-            self._stop_live_capture()
-            self.live_status_var.set(f"Không lưu được PGN: {exc}")
-            return
+            save_error = exc
         if not self.live_branch_active:
             self._fill_moves()
             if was_at_live_end:
                 self._refresh()
             elif self.ply:
                 self.move_list.selection_set(self.ply - 1)
-        self.live_status_var.set(f"Đang nhận nước đi trực tiếp · {len(self.live_moves)} nước · "
-                                 f"vừa ghi {current.san(move)}")
-        if following.is_game_over():
-            self.live_status_var.set("Ván đã kết thúc; PGN đã lưu trên ổ D. "
-                                     "Đang đợi ván tiếp theo trong cửa sổ này…")
+        self.live_status_var.set(
+            f"Đang nhận nước đi trực tiếp · {len(self.live_moves)} nước · "
+            f"vừa ghi {current.san(move)}"
+            + (f" · Không lưu được PGN: {save_error}" if save_error else "")
+        )
 
     def _stop_live_capture(self) -> None:
         if self.live_job is not None:
@@ -1121,9 +1145,10 @@ class ChessReviewApp:
         self.live_button.configure(text="Theo dõi bàn cờ trên màn hình…")
         self.move_entry.configure(state="normal")
         self.play_button.configure(state="normal")
+        saved = bool(self.live_game_path and self.live_game_path.is_file())
         self.live_status_var.set(
             f"Đã dừng theo dõi · {count} nước; PGN lưu tại D:\\Chess\\data\\games."
-            if count else "Đã dừng theo dõi trước khi có nước đi."
+            if saved else f"Đã dừng theo dõi · {count} nước; chưa có PGN của đoạn này."
         )
 
     def _analysis_settings_changed(self, _event: tk.Event) -> None:
@@ -1369,6 +1394,7 @@ class ChessReviewApp:
         self.live_positions = None
         self.live_branch_active = False
         self.live_flipped = False
+        self.live_turn_uncertain = False
         self._dismiss_coach_panel()
         self.current_game = game
         self.original_review_state = None
@@ -1413,6 +1439,7 @@ class ChessReviewApp:
         self.live_positions = None
         self.live_branch_active = False
         self.live_flipped = False
+        self.live_turn_uncertain = False
         self._dismiss_coach_panel()
         self.user_acted = True
         self._stop_autoplay()
@@ -2240,6 +2267,12 @@ class ChessReviewApp:
             self.detail_var.set("")
             self._set_coach_mood("")
         self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
+        if self.live_tracker is not None and self.live_turn_uncertain and not self.live_branch_active:
+            self.grade_var.set("Chưa rõ lượt đi")
+            self._set_grade_badge(None)
+            self.detail_var.set("Vị trí quân đã cập nhật từ ảnh; chờ nước tiếp theo để xác định lượt.")
+            self.status_var.set("")
+            return
         self._request_analysis()
 
     def _render_board(self) -> None:

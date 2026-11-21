@@ -46,6 +46,7 @@ class LiveRecoveryTests(unittest.TestCase):
         self.app.positions = self.app.live_positions
         self.app.live_branch_active = False
         self.app.live_flipped = False
+        self.app.live_turn_uncertain = False
         self.app.ply = 0
         self.app.live_tracker = LiveBoardTracker(board.copy(stack=True), False)
         self.app.live_tracker.observe(render(board))
@@ -99,6 +100,8 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertEqual(board.board_fen(), self.app.positions[-1].board_fen())
         self.assertNotEqual(self.old_pgn, self.app.live_game_path)
         self.assertEqual("previous segment\n", self.old_pgn.read_text(encoding="utf-8"))
+        self.assertFalse(self.app.live_game_path.is_file())
+        self.app._apply_live_move(self.app.live_positions[-1].parse_san("Nc6"))
         self.assertTrue(self.app.live_game_path.is_file())
 
     def test_can_try_moves_and_go_back_while_live_capture_continues(self) -> None:
@@ -224,7 +227,6 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(self.app.live_tracker)
         self.assertTrue(self.app.live_positions[-1].is_checkmate())
         self.assertTrue(self.app.live_game_path.is_file())
-        self.assertIn("Đang đợi ván tiếp theo", self.app.live_status_var.get())
 
         source = Image.new("RGB", (700, 700), "#14223b")
         source.paste(render(chess.Board(), True), (80, 80))
@@ -258,6 +260,52 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertTrue(self.app.live_flipped)
         self.app._return_to_live()
         self.assertTrue(self.app.flipped)
+
+    def test_recreates_clear_board_even_when_turn_is_not_visible(self) -> None:
+        self._setup_capture(chess.Board())
+        shown = chess.Board()
+        for san in ("e4", "e5", "Nf3"):
+            last = shown.push_san(san)
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(shown), (80, 80))
+
+        self.app._recover_live_position(source)
+        self.assertEqual(shown.board_fen(), self.app.positions[-1].board_fen())
+        self.assertTrue(self.app.live_turn_uncertain)
+        self.assertEqual([], self.app.moves)
+        self.assertFalse(self.app.live_game_path.is_file())
+        self.assertEqual("Chưa rõ lượt đi", self.app.grade_var.get())
+
+        confirmed = Image.new("RGB", (700, 700), "#14223b")
+        confirmed.paste(render(shown,
+                               highlights=(last.from_square, last.to_square)), (80, 80))
+
+        class FakeStream:
+            closed = False
+
+            def drain(self, _limit: int) -> list[Image.Image]:
+                return [confirmed]
+
+            def close(self) -> None:
+                self.closed = True
+
+        self.app.live_stream = FakeStream()
+        self.app.live_window = 1
+        self.app.live_recovery_after = 0
+        self.app._capture_live_tick()
+        self.assertFalse(self.app.live_turn_uncertain)
+        self.assertEqual(shown.turn, self.app.positions[-1].turn)
+        self.assertEqual(shown.board_fen(), self.app.positions[-1].board_fen())
+
+    def test_save_error_does_not_stop_board_following(self) -> None:
+        self._setup_capture(chess.Board())
+        with patch.object(Path, "write_text", side_effect=OSError("disk full")):
+            self.app._apply_live_move(self.app.live_positions[-1].parse_san("e4"))
+        self.assertIsNotNone(self.app.live_tracker)
+        self.assertEqual("e4", chess.Board().san(self.app.live_moves[-1]))
+        self.assertEqual(self.app.live_positions[-1].board_fen(),
+                         self.app.positions[-1].board_fen())
+        self.assertIn("Không lưu được PGN", self.app.live_status_var.get())
 
 
 if __name__ == "__main__":
