@@ -324,7 +324,10 @@ def _border_alignment_score(image: Image.Image,
     """Chessboard grid lines should separate contrasting square colors."""
     left, top, right, bottom = box
     width, height = right - left, bottom - top
-    offset = max(1, round(min(width, height) / 200))
+    # Compare pixels immediately across each grid line. A wider offset gives
+    # the same maximum score to many crops shifted by several pixels, which
+    # can bury the actual board outside the candidates we recognize.
+    offset = 1
     pixels = image.load()
     contrasts = []
     for line in range(1, 8):

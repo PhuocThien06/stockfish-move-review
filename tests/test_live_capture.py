@@ -383,6 +383,17 @@ class LiveCaptureTests(unittest.TestCase):
         self.assertEqual(board.board_fen(), found.board_fen())
         self.assertNotEqual(selected, aligned)
 
+    def test_aligns_large_board_with_asymmetric_selection(self) -> None:
+        board = chess.Board()
+        source = Image.new("RGB", (1920, 1032), "#14223b")
+        source.paste(render(board).resize((776, 776), Image.Resampling.BILINEAR),
+                     (253, 187))
+        selected = (234, 175, 1037, 972)
+        aligned, found, _ = align_board(source, selected, False, chess.WHITE)
+        self.assertEqual(board.board_fen(), found.board_fen())
+        self.assertLessEqual(abs(aligned[0] - 253), 4)
+        self.assertLessEqual(abs(aligned[1] - 187), 4)
+
     def test_alignment_does_not_invent_starting_pieces_on_empty_board(self) -> None:
         empty = render(chess.Board(None))
         with self.assertRaises(ValueError):
