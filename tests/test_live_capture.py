@@ -6,10 +6,16 @@ import unittest
 import chess
 from PIL import Image, ImageDraw
 
-from live_capture import LiveBoardTracker, align_board, recognize_board
+from live_capture import LiveBoardTracker, align_board, infer_turn, recognize_board
 
 
 PIECES = Path(__file__).resolve().parents[1] / "pieces"
+
+
+def confirm(tracker: LiveBoardTracker, frame: Image.Image) -> list[chess.Move]:
+    """A position is recorded only after the same frame has settled."""
+    assert tracker.observe(frame, now=0) == []
+    return tracker.observe(frame, now=1)
 
 
 def render(board: chess.Board, flipped: bool = False,
@@ -44,7 +50,7 @@ class LiveCaptureTests(unittest.TestCase):
             move = board.parse_san(san)
             board.push(move)
             frame = render(board)
-            self.assertEqual([move], tracker.observe(frame), san)
+            self.assertEqual([move], confirm(tracker, frame), san)
         self.assertEqual(board.fen(), tracker.board.fen())
 
     def test_tracks_flipped_board(self) -> None:
@@ -54,7 +60,7 @@ class LiveCaptureTests(unittest.TestCase):
         move = board.parse_san("d4")
         board.push(move)
         frame = render(board, True)
-        self.assertEqual([move], tracker.observe(frame))
+        self.assertEqual([move], confirm(tracker, frame))
 
     def test_last_move_highlights_do_not_hide_next_move(self) -> None:
         board = chess.Board()
@@ -64,7 +70,7 @@ class LiveCaptureTests(unittest.TestCase):
             move = board.parse_san(san)
             board.push(move)
             frame = render(board, highlights=(move.from_square, move.to_square))
-            self.assertEqual([move], tracker.observe(frame))
+            self.assertEqual([move], confirm(tracker, frame))
 
     def test_capture_and_queen_promotion(self) -> None:
         board = chess.Board("4k3/P7/8/8/8/8/8/4K3 w - - 0 1")
@@ -73,7 +79,7 @@ class LiveCaptureTests(unittest.TestCase):
         move = board.parse_san("a8=Q+")
         board.push(move)
         frame = render(board)
-        self.assertEqual([move], tracker.observe(frame))
+        self.assertEqual([move], confirm(tracker, frame))
 
     def test_en_passant(self) -> None:
         board = chess.Board()
@@ -84,7 +90,7 @@ class LiveCaptureTests(unittest.TestCase):
         move = board.parse_san("exd6")
         board.push(move)
         frame = render(board)
-        self.assertEqual([move], tracker.observe(frame))
+        self.assertEqual([move], confirm(tracker, frame))
 
     def test_starts_from_midgame_position(self) -> None:
         board = chess.Board()
@@ -97,7 +103,7 @@ class LiveCaptureTests(unittest.TestCase):
         tracker.observe(render(board))
         move = board.parse_san("Nc6")
         board.push(move)
-        self.assertEqual([move], tracker.observe(render(board)))
+        self.assertEqual([move], confirm(tracker, render(board)))
 
     def test_reads_flipped_midgame_with_highlights(self) -> None:
         board = chess.Board()
@@ -117,8 +123,45 @@ class LiveCaptureTests(unittest.TestCase):
         initial.push(first)
         second = initial.parse_san("e5")
         initial.push(second)
-        self.assertEqual([first, second], tracker.observe(render(initial)))
+        self.assertEqual([first, second], confirm(tracker, render(initial)))
         self.assertEqual(initial.fen(), tracker.board.fen())
+
+    def test_does_not_record_pawn_on_intermediate_animation_square(self) -> None:
+        initial = chess.Board()
+        tracker = LiveBoardTracker(initial.copy(), False)
+        tracker.observe(render(initial))
+        intermediate = initial.copy()
+        intermediate.push_san("e3")
+        self.assertEqual([], tracker.observe(render(intermediate), now=0))
+        final = initial.copy()
+        move = final.push_san("e4")
+        self.assertEqual([], tracker.observe(render(final), now=.08))
+        self.assertEqual([move], tracker.observe(render(final), now=.6))
+        self.assertEqual(final.fen(), tracker.board.fen())
+
+    def test_last_move_highlight_rejects_intermediate_destination(self) -> None:
+        initial = chess.Board()
+        tracker = LiveBoardTracker(initial.copy(), False)
+        tracker.observe(render(initial))
+        intermediate = initial.copy()
+        intermediate.push_san("e3")
+        highlight = (chess.E2, chess.E4)
+        self.assertEqual([], tracker.observe(render(intermediate, highlights=highlight), now=0))
+        final = initial.copy()
+        move = final.push_san("e4")
+        frame = render(final, highlights=highlight)
+        self.assertEqual([], tracker.observe(frame, now=.08))
+        self.assertEqual([move], tracker.observe(frame, now=.5))
+
+    def test_infers_turn_from_last_move_highlight(self) -> None:
+        board = chess.Board()
+        self.assertEqual(chess.WHITE, infer_turn(render(board), board, False))
+        move = board.push_san("e4")
+        self.assertEqual(chess.BLACK, infer_turn(
+            render(board, highlights=(move.from_square, move.to_square)),
+            board, False,
+        ))
+        self.assertIsNone(infer_turn(render(board), board, False))
 
     def test_reads_bright_board_without_changing_system_hdr(self) -> None:
         board = chess.Board()
@@ -130,7 +173,7 @@ class LiveCaptureTests(unittest.TestCase):
                                 False, board.turn)
         self.assertEqual(board.board_fen(), found.board_fen())
         self.assertEqual(list(board.move_stack),
-                         tracker.observe(render(board, light="#ffffff", dark="#ffdda3")))
+                         confirm(tracker, render(board, light="#ffffff", dark="#ffdda3")))
 
     def test_aligns_selected_border_at_start_and_midgame(self) -> None:
         board = chess.Board()

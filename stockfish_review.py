@@ -33,7 +33,7 @@ from coach import explain_move
 from grade_badges import draw_badge, make_badge, text_color
 from local_store import load_favorites, prune_old_games, save_favorites
 from live_capture import (LiveBoardTracker, WindowCaptureStream, align_board,
-                          board_crop, reduce_glare, visible_windows)
+                          board_crop, infer_turn, reduce_glare, visible_windows)
 from material import DISPLAY_ORDER, material_snapshot
 
 
@@ -549,7 +549,7 @@ class ChessReviewApp:
         if not windows:
             messagebox.showerror("Không tìm thấy cửa sổ", "Hãy mở cửa sổ có bàn cờ rồi thử lại.")
             return
-        from PIL import ImageTk
+        from PIL import ImageChops, ImageStat, ImageTk
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Chọn cửa sổ và vùng bàn cờ")
@@ -571,7 +571,8 @@ class ChessReviewApp:
         preview.pack(fill="both", expand=True, padx=12, pady=5)
         state: dict = {"image": None, "photo": None, "scale": 1.0,
                        "start": None, "box": None, "rectangle": None,
-                       "stream": None, "hwnd": None}
+                       "stream": None, "hwnd": None, "begin_frame": None,
+                       "begin_retries": 0, "starting": False}
 
         def cancel() -> None:
             if state["stream"] is not None:
@@ -600,7 +601,8 @@ class ChessReviewApp:
                                                       round(source.height * factor))))
                 photo = ImageTk.PhotoImage(display)
                 state.update({"image": source, "photo": photo, "scale": factor,
-                              "start": None, "box": None, "rectangle": None})
+                              "start": None, "box": None, "rectangle": None,
+                              "begin_frame": None})
                 preview.delete("all")
                 preview.create_image(0, 0, image=photo, anchor="nw")
                 status.set("Kéo một hình vuông sát mép bàn cờ; không lấy đồng hồ hoặc danh sách nước.")
@@ -635,6 +637,7 @@ class ChessReviewApp:
                 status.set(str(exc))
                 return
             state["box"] = box
+            state["begin_frame"] = None
             status.set("Đã chọn bàn cờ. Kiểm tra lượt hiện tại rồi bấm Bắt đầu theo dõi.")
 
         preview.bind("<ButtonPress-1>", press)
@@ -646,26 +649,68 @@ class ChessReviewApp:
         flipped = tk.BooleanVar(value=self.flipped)
         ttk.Checkbutton(buttons, text="Đen ở dưới", variable=flipped).pack(side="left", padx=12)
         ttk.Label(buttons, text="Lượt hiện tại:").pack(side="left", padx=(12, 4))
-        turn_selection = ttk.Combobox(buttons, values=("Trắng", "Đen"),
-                                      width=7, state="readonly")
+        turn_selection = ttk.Combobox(buttons, values=("Tự động", "Trắng", "Đen"),
+                                      width=9, state="readonly")
         turn_selection.current(0)
         turn_selection.pack(side="left")
 
         def begin() -> None:
+            if not dialog.winfo_exists():
+                return
             box = state["box"]
             if box is None:
                 status.set("Hãy chụp và chọn vùng bàn cờ trước.")
                 return
+            if not state["starting"]:
+                state["starting"] = True
+                state["begin_retries"] = 0
+                begin_button.configure(state="disabled")
             hwnd, title = windows[selection.current()]
             try:
                 stream = state["stream"]
-                if stream is None or state["hwnd"] != hwnd:
+                if stream is None or stream.closed or state["hwnd"] != hwnd:
                     raise ValueError("Hãy chụp lại cửa sổ đã chọn.")
-                box, starting_board, first_frame = align_board(
-                    stream.latest(timeout=4), box, flipped.get(),
-                    turn_selection.current() == 0,
-                )
+                source = stream.latest(timeout=4)
+                if state["begin_frame"] is None:
+                    state["begin_frame"] = source
+                    status.set("Đang đợi ảnh bàn cờ ổn định…")
+                    dialog.after(180, begin)
+                    return
+                before = board_crop(state["begin_frame"], box)
+                after = board_crop(source, box)
+                change = max(ImageStat.Stat(ImageChops.difference(before, after)).mean)
+                if change > 1.5:
+                    state["begin_frame"] = source
+                    state["begin_retries"] += 1
+                    if state["begin_retries"] < 12:
+                        dialog.after(180, begin)
+                        return
+                    raise ValueError("Bàn cờ đang thay đổi liên tục. Hãy đợi nước đi hoàn tất rồi thử lại.")
+                selected_turn = turn_selection.current()
+                if selected_turn:
+                    box, starting_board, first_frame = align_board(
+                        source, box, flipped.get(), selected_turn == 1,
+                    )
+                else:
+                    try:
+                        box, starting_board, first_frame = align_board(
+                            source, box, flipped.get(), chess.WHITE,
+                        )
+                    except ValueError:
+                        box, starting_board, first_frame = align_board(
+                            source, box, flipped.get(), chess.BLACK,
+                        )
+                    inferred = infer_turn(first_frame, starting_board, flipped.get())
+                    if inferred is None:
+                        raise ValueError("Không xác định được lượt đi từ ảnh. "
+                                         "Hãy chọn Trắng hoặc Đen ở mục Lượt hiện tại.")
+                    starting_board.turn = inferred
+                    if not starting_board.is_valid():
+                        raise ValueError("Lượt đi suy ra không hợp lệ; hãy chọn thủ công.")
             except (OSError, ValueError, TimeoutError) as exc:
+                state["starting"] = False
+                state["begin_frame"] = None
+                begin_button.configure(state="normal")
                 status.set(f"Không đọc được bàn cờ: {exc}")
                 return
             stream.drain(128)
@@ -675,8 +720,9 @@ class ChessReviewApp:
             self._begin_live_capture(hwnd, title, box, flipped.get(), first_frame,
                                      stream, starting_board)
 
-        ttk.Button(buttons, text="Bắt đầu theo dõi", command=begin,
-                   style="Accent.TButton").pack(side="right")
+        begin_button = ttk.Button(buttons, text="Bắt đầu theo dõi", command=begin,
+                                  style="Accent.TButton")
+        begin_button.pack(side="right")
 
     def _begin_live_capture(self, hwnd: int, title: str,
                             box: tuple[int, int, int, int], flipped: bool,
@@ -711,7 +757,7 @@ class ChessReviewApp:
             if self.live_stream.closed:
                 raise OSError("Cửa sổ nguồn đã đóng.")
             frames = self.live_stream.drain()
-            if not frames and tracker.unmatched_frames:
+            if not frames and (tracker.unmatched_frames or tracker.pending_moves):
                 frames = [self.live_stream.latest()]
             for source in frames:
                 frame = board_crop(source, self.live_region)
@@ -727,8 +773,8 @@ class ChessReviewApp:
             saved_path = self.live_game_path
             self._stop_live_capture()
             self.live_status_var.set(
-                "Đã dừng vì ảnh bàn cờ đổi nhưng không nhận được nước hợp lệ. "
-                f"PGN trước đó đã lưu tại {saved_path}. Chọn lại vùng và chiều bàn để theo dõi ván mới."
+                "Đã dừng vì ảnh bàn cờ không còn khớp nước hợp lệ (có thể đã bỏ lỡ nước). "
+                f"PGN trước đó đã lưu tại {saved_path}. Chọn lại vùng, chiều bàn và lượt đi để theo dõi tiếp."
             )
         if self.live_tracker is not None:
             self.live_job = self.root.after(60, self._capture_live_tick)

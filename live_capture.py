@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
@@ -254,6 +255,38 @@ def _difference(first: bytes, second: bytes) -> float:
     return sum(abs(a - b) for a, b in zip(first, second)) / len(first)
 
 
+def _highlighted_squares(image: Image.Image, flipped: bool) -> set[int] | None:
+    """Find the two last-move squares when the board marks them clearly."""
+    frame = image.resize((512, 512), Image.Resampling.BILINEAR).convert("RGB")
+    backgrounds = _square_backgrounds(frame, flipped)
+    marked = set()
+    for row in range(8):
+        for col in range(8):
+            file_ = 7 - col if flipped else col
+            rank = row if flipped else 7 - row
+            square = chess.square(file_, rank)
+            base = backgrounds[(file_ + rank) % 2 == 0]
+            pixel = frame.getpixel((col * 64 + 4, row * 64 + 4))
+            if sum(abs(pixel[channel] - base[channel]) for channel in range(3)) >= 40:
+                marked.add(square)
+    return marked if len(marked) == 2 else None
+
+
+def infer_turn(image: Image.Image, board: chess.Board,
+               flipped: bool) -> chess.Color | None:
+    """Infer the next side from the highlighted previous move when available."""
+    if board.board_fen() == chess.STARTING_BOARD_FEN:
+        return chess.WHITE
+    highlighted = _highlighted_squares(image, flipped)
+    if highlighted is None:
+        return None
+    occupied = [board.piece_at(square) for square in highlighted
+                if board.piece_at(square) is not None]
+    if len(occupied) == 1:
+        return not occupied[0].color
+    return None
+
+
 def _changed_squares(board: chess.Board, move: chess.Move) -> set[int]:
     changed = {move.from_square, move.to_square}
     if board.is_en_passant(move):
@@ -274,12 +307,42 @@ class LiveBoardTracker:
     reference: list[bytes] | None = None
     unmatched_frames: int = 0
     last_unmatched: list[bytes] | None = None
+    pending_signature: list[bytes] | None = None
+    pending_moves: list[chess.Move] | None = None
+    pending_since: float = 0.0
+    pending_delay: float = 0.0
 
-    def observe(self, image: Image.Image) -> list[chess.Move]:
+    def _hold(self, moves: list[chess.Move], current: list[bytes],
+              now: float, highlighted: set[int] | None) -> list[chess.Move]:
+        self.pending_moves = moves
+        self.pending_signature = current
+        self.pending_since = now
+        self.pending_delay = .12 if highlighted else .45
+        self.last_unmatched = None
+        self.unmatched_frames = 0
+        return []
+
+    def observe(self, image: Image.Image, now: float | None = None) -> list[chess.Move]:
+        now = time.monotonic() if now is None else now
         current = _signature(image, self.flipped)
         if self.reference is None:
             self.reference = current
             return []
+        if self.pending_signature is not None:
+            if max(_difference(a, b) for a, b in zip(self.pending_signature, current)) < 2.5:
+                if now - self.pending_since >= self.pending_delay:
+                    moves = self.pending_moves or []
+                    for move in moves:
+                        self.board.push(move)
+                    self.reference = current
+                    self.pending_signature = None
+                    self.pending_moves = None
+                    self.unmatched_frames = 0
+                    self.last_unmatched = None
+                    return moves
+                return []
+            self.pending_signature = None
+            self.pending_moves = None
         changes = [_difference(a, b) for a, b in zip(self.reference, current)]
         if max(changes) < 7:
             self.unmatched_frames = 0
@@ -305,18 +368,17 @@ class LiveBoardTracker:
                                 if square not in changed), reverse=True)[:2])
             candidates.append((signal - spill, move, changed))
         candidates.sort(key=lambda item: item[0], reverse=True)
+        highlighted = _highlighted_squares(image, self.flipped)
         if candidates:
             best_score, move, expected = candidates[0]
             if (best_score >= 22
                     and (len(candidates) == 1 or best_score - candidates[1][0] >= 4)
                     and sum(amount for square, amount in enumerate(changes)
                             if square not in expected and amount > 8)
-                    <= sum(changes[s] for s in expected) * .55):
-                self.board.push(move)
-                self.reference = current
-                self.unmatched_frames = 0
-                self.last_unmatched = None
-                return [move]
+                    <= sum(changes[s] for s in expected) * .55
+                    and (highlighted is None
+                         or highlighted == {move.from_square, move.to_square})):
+                return self._hold([move], current, now, highlighted)
 
         # Two moves may occur between captured frames. Match the visible piece
         # placement to legal pairs rather than guessing a single move.
@@ -343,12 +405,9 @@ class LiveBoardTracker:
             probe.pop()
         if len(matches) == 1:
             pair = list(matches[0])
-            for move in pair:
-                self.board.push(move)
-            self.reference = current
-            self.unmatched_frames = 0
-            self.last_unmatched = None
-            return pair
+            if (highlighted is None or highlighted
+                    == {pair[-1].from_square, pair[-1].to_square}):
+                return self._hold(pair, current, now, highlighted)
         self.last_unmatched = current
         self.unmatched_frames += 1
         return []
