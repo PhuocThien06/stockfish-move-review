@@ -32,7 +32,8 @@ from analysis_core import (
 from chesscom_import import sync_recent_games
 from coach import explain_move
 from grade_badges import draw_badge, make_badge, text_color
-from local_store import load_favorites, prune_old_games, save_favorites
+from local_store import (load_favorites, load_last_username, prune_old_games,
+                         save_favorites, save_last_username)
 from live_capture import (LiveBoardTracker, WindowCaptureStream, align_board,
                           board_crop, infer_turn, recognize_board, reduce_glare,
                           visible_windows)
@@ -315,7 +316,7 @@ class ChessReviewApp:
         self.positions: list[chess.Board] = [chess.Board()]
         self.ply = 0
         self.engine_var = tk.StringVar(value=str(APP_HOME / "engine" / "stockfish.exe"))
-        self.username_var = tk.StringVar(value="TheFallenWizard")
+        self.username_var = tk.StringVar(value=load_last_username(GAMES_DIR))
         self.seconds_var = tk.StringVar(value="3")
         self.status_var = tk.StringVar(value="")
         self.grade_var = tk.StringVar(value="Chưa có nước đi")
@@ -1207,25 +1208,36 @@ class ChessReviewApp:
             self.status_var.set("Đang đồng bộ ván đã kết thúc…")
             return
         username = self.username_var.get().strip()
-        self.status_var.set(f"Đang lấy tối đa 10 ván đã kết thúc gần nhất của {username}…")
+        try:
+            save_last_username(GAMES_DIR, username)
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        except OSError as exc:
+            save_warning = f" · Không lưu được tên trên ổ D: {exc}"
+        else:
+            save_warning = ""
+        self.status_var.set(f"Đang lấy tối đa 10 ván đã kết thúc gần nhất của {username}…"
+                            + save_warning)
         self.sync_future = self.sync_executor.submit(sync_recent_games, username, GAMES_DIR)
         self.sync_future.add_done_callback(
-            lambda future: self.sync_events.put((future, auto_load, username))
+            lambda future: self.sync_events.put((future, auto_load, username, save_warning))
         )
 
     def _poll_sync(self) -> None:
         try:
             while True:
-                future, auto_load, username = self.sync_events.get_nowait()
+                future, auto_load, username, save_warning = self.sync_events.get_nowait()
                 try:
                     result = future.result()
                 except Exception as exc:
-                    self.status_var.set(f"Đồng bộ không thành công: {exc}")
+                    self.status_var.set(f"Đồng bộ không thành công: {exc}" + save_warning)
                     result = None
                 if result is not None:
                     self.status_var.set(
                         f"Đã đồng bộ {result['total']} ván gần nhất của {username} (tối đa 10); "
                         f"thêm {result['created']} ván vào D:\\Chess\\data\\games."
+                        + save_warning
                     )
                 if auto_load and not self.user_acted and self.current_game_path is None:
                     latest = result["latest"] if result else None

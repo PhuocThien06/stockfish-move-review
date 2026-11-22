@@ -13,6 +13,33 @@ def favorites_path(directory: Path) -> Path:
     return directory.parent / "favorites.json"
 
 
+def settings_path(directory: Path) -> Path:
+    return directory.parent / "settings.json"
+
+
+def load_last_username(directory: Path, default: str = "EnergeticCyborg") -> str:
+    """Return the account used for the last sync, keeping settings on drive D."""
+    try:
+        data = json.loads(settings_path(directory).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+    username = data.get("last_username") if isinstance(data, dict) else None
+    return username if isinstance(username, str) and re.fullmatch(
+        r"[A-Za-z0-9_.-]{2,32}", username
+    ) else default
+
+
+def save_last_username(directory: Path, username: str) -> None:
+    username = username.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{2,32}", username):
+        raise ValueError("Tên tài khoản không hợp lệ.")
+    path = settings_path(directory)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"last_username": username}, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
 def load_favorites(directory: Path) -> set[str]:
     path = favorites_path(directory)
     if not path.is_file():

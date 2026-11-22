@@ -1,13 +1,16 @@
 """Navigation stays responsive while Stockfish works in the background."""
 
 import sys
+import tempfile
 import tkinter as tk
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import chess
 
 from stockfish_review import ChessReviewApp
+from local_store import load_last_username
 
 
 @unittest.skipUnless(sys.platform == "win32", "The desktop UI is tested on Windows")
@@ -47,6 +50,20 @@ class UiResponsivenessTests(unittest.TestCase):
         self.assertEqual(first, self.app.move_list.get(0))
         self.assertIn("Best Move", self.app.move_list.get(1))
         self.assertEqual((1,), self.app.move_list.curselection())
+
+    def test_search_name_is_saved_before_a_failed_network_sync(self) -> None:
+        scratch = Path(__file__).resolve().parents[1] / "work"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            games = Path(temporary) / "games"
+            self.app.username_var.set("EnergeticCyborg")
+            with patch("stockfish_review.GAMES_DIR", games), patch(
+                "stockfish_review.sync_recent_games", side_effect=ValueError("offline")
+            ):
+                self.app._sync_games()
+                with self.assertRaises(ValueError):
+                    self.app.sync_future.result()
+                self.assertEqual("EnergeticCyborg", load_last_username(games))
 
 
 if __name__ == "__main__":
