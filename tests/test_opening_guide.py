@@ -1,8 +1,12 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import chess
+import chess.engine
 
-from opening_guide import get_opening_guide, opening_explanation
+from analysis_core import analyze_position
+from opening_guide import OpeningGuide, OpeningNode, get_opening_guide, opening_explanation
 
 
 def play(*sans):
@@ -69,6 +73,62 @@ class OpeningGuideTests(unittest.TestCase):
         explanation = opening_explanation(positions, chess.BLACK, master_data=data)
         self.assertIn("• Nf6", explanation)
         self.assertIn("chưa chắc là Book Move", explanation)
+
+    def test_off_catalog_engine_plan_does_not_claim_book_status(self):
+        positions = play("e4", "e5", "Nh3")
+        board = positions[-1]
+        move = board.parse_san("d5")
+        next_board = board.copy(stack=True)
+        next_board.push(move)
+        reply = next_board.parse_san("exd5")
+        explanation = opening_explanation(
+            positions, chess.BLACK, master_data={"moves": []},
+            engine_move=move, engine_line=[move, reply],
+        )
+        self.assertIn("Stockfish ưu tiên d5", explanation)
+        self.assertIn("không tự mang nhãn Book Move", explanation)
+        self.assertIn("exd5", explanation)
+        self.assertNotIn("Bruno không đoán", explanation)
+
+    def test_only_valid_engine_reentry_is_called_a_transposition(self):
+        positions = play("e4", "e5", "Nh3")
+        board = positions[-1]
+        guide = OpeningGuide(Path("missing-opening-data"))
+        guide.nodes[guide.key(positions[-2])] = OpeningNode(names=[("C20", "King's Pawn Game")])
+        move = board.parse_san("d5")
+        after = board.copy(stack=False)
+        after.push(move)
+        guide.nodes[guide.key(after)] = OpeningNode(names=[("C20", "King's Pawn Game: Test")])
+        self.assertEqual([move], [candidate for candidate, _ in guide.reentries(board)])
+        explanation = opening_explanation(positions, chess.BLACK, guide=guide, engine_move=move)
+        self.assertIn("chuyển vị trở lại danh mục", explanation)
+        self.assertIn("King's Pawn Game: Test", explanation)
+        opponent_explanation = opening_explanation(positions, chess.WHITE, guide=guide, engine_move=move)
+        self.assertNotIn("Stockfish ưu tiên", opponent_explanation)
+
+    def test_reuses_analysed_reply_without_an_extra_engine_search(self):
+        positions = play("e4", "e5", "Nh3")
+        before, current = positions[-2:]
+        move = before.parse_san("Nh3")
+        reply = current.parse_san("d5")
+        score = chess.engine.PovScore(chess.engine.Cp(30), chess.WHITE)
+        assessment = {
+            "category": "good", "white_score": score, "white_ep": 0.52,
+            "best_prior": "Nf3", "ep_loss": 0.01, "mate": False,
+            "cp_loss": 20, "played_pv": [move, reply],
+        }
+        with patch("analysis_core.assess_move", return_value=assessment):
+            result = analyze_position(None, before, move, current, False, 1.0)
+        self.assertEqual(reply, result["next_best_move"])
+        self.assertEqual([reply], result["next_best_line"])
+
+    def test_unknown_turn_hides_engine_plan(self):
+        positions = play("e4", "e5", "Nh3")
+        move = positions[-1].parse_san("d5")
+        explanation = opening_explanation(
+            positions, chess.BLACK, turn_known=False, engine_move=move,
+        )
+        self.assertNotIn("Stockfish ưu tiên", explanation)
 
 
 if __name__ == "__main__":

@@ -253,7 +253,7 @@ def analyze_position(
     result = {
         "category": "", "detail": "", "score": None, "white_ep": 0.5,
         "best_prior": "", "lines": [], "assessment": None,
-        "next_best_move": None,
+        "next_best_move": None, "next_best_line": [],
     }
     if before is not None and played_move is not None:
         assessment = assess_move(engine, before, played_move, seconds)
@@ -269,14 +269,21 @@ def analyze_position(
                    else f" · {assessment['cp_loss']} cp")
             ),
         })
+        # The forced-root PV already contains Stockfish's reply to the move
+        # just played. Reuse it for opening guidance instead of searching the
+        # current board a second time during live capture.
+        reply_line = assessment.get("played_pv", [])[1:]
+        if reply_line and reply_line[0] in current.legal_moves:
+            result["next_best_move"] = reply_line[0]
+            result["next_best_line"] = reply_line[:3]
     elif not current.is_game_over():
         info = engine.analyse(current, chess.engine.Limit(time=seconds),
-                              info=(chess.engine.INFO_SCORE | chess.engine.INFO_PV
-                                    if show_best_arrow else chess.engine.INFO_SCORE))
+                              info=chess.engine.INFO_SCORE | chess.engine.INFO_PV)
         result["score"] = info["score"].pov(chess.WHITE)
         result["white_ep"] = expected_points(info, chess.WHITE)
-        if show_best_arrow and info.get("pv"):
+        if info.get("pv"):
             result["next_best_move"] = info["pv"][0]
+            result["next_best_line"] = info["pv"][:3]
 
     if full and not current.is_game_over():
         lines = engine.analyse(
@@ -298,6 +305,7 @@ def analyze_position(
             result["white_ep"] = expected_points(lines[0], chess.WHITE)
             if lines[0].get("pv"):
                 result["next_best_move"] = lines[0]["pv"][0]
+                result["next_best_line"] = lines[0]["pv"][:3]
     elif show_best_arrow and before is not None and not current.is_game_over():
         next_info = engine.analyse(
             current, chess.engine.Limit(time=seconds),
@@ -307,6 +315,7 @@ def analyze_position(
         result["white_ep"] = expected_points(next_info, chess.WHITE)
         if next_info.get("pv"):
             result["next_best_move"] = next_info["pv"][0]
+            result["next_best_line"] = next_info["pv"][:3]
     return result
 
 

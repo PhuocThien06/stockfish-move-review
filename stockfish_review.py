@@ -2312,11 +2312,15 @@ class ChessReviewApp:
                 future = self.opening_executor.submit(fetch_master_opening, board.copy(stack=False))
                 future.add_done_callback(lambda finished, position=key:
                                          self.opening_results.put((position, finished)))
+            analysis = self.analysis_cache.get((self.ply, self.full)) or self.analysis_cache.get(
+                (self.ply, not self.full), {})
             message = opening_explanation(
                 self.positions[:self.ply + 1], chess.BLACK if self.flipped else chess.WHITE,
                 turn_known=not (self.live_turn_uncertain and not self.live_branch_active),
                 guide=guide, master_data=self.opening_cache.get(key),
                 waiting_for_stats=key in self.opening_pending,
+                engine_move=analysis.get("next_best_move"),
+                engine_line=analysis.get("next_best_line"),
             )
         except (OSError, ValueError):
             message = ""
@@ -2605,6 +2609,8 @@ class ChessReviewApp:
             self.full_text.insert("1.0", "\n".join(notes))
             self.full_text.configure(state="disabled")
         self.status_var.set("")
+        if self.live_tracker is not None:
+            self._refresh_opening_guide()
 
     def _dismiss_coach_panel(self) -> None:
         if self.coach_close is not None:

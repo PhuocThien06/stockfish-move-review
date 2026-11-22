@@ -73,6 +73,17 @@ class OpeningGuide:
                 break
         return moves
 
+    def reentries(self, board: chess.Board) -> list[tuple[chess.Move, OpeningNode]]:
+        """Legal one-move transpositions back into a catalogued position."""
+        found = []
+        for move in board.legal_moves:
+            after = board.copy(stack=False)
+            after.push(move)
+            node = self.node(after)
+            if node is not None:
+                found.append((move, node))
+        return found
+
 
 @lru_cache(maxsize=1)
 def get_opening_guide() -> OpeningGuide:
@@ -110,14 +121,16 @@ def _reason(board: chess.Board, move: chess.Move) -> str:
         return "phát triển quân ra khỏi hàng cuối"
     if board.gives_check(move):
         return "tạo nước chiếu buộc đối phương đáp lại"
-    return f"tiếp tục một nhánh lý thuyết tại ô {destination}"
+    return f"cải thiện vị trí quân tại {destination}"
 
 
 def opening_explanation(positions: list[chess.Board], player_color: chess.Color,
                         guide: OpeningGuide | None = None,
                         turn_known: bool = True,
                         master_data: dict | None = None,
-                        waiting_for_stats: bool = False) -> str:
+                        waiting_for_stats: bool = False,
+                        engine_move: chess.Move | None = None,
+                        engine_line: list[chess.Move] | None = None) -> str:
     """Explain a known opening position without claiming to know a player's intent."""
     if not positions:
         return ""
@@ -127,7 +140,8 @@ def opening_explanation(positions: list[chess.Board], player_color: chess.Color,
     current_name = (max(node.names, key=lambda entry: len(entry[1]))
                     if node and node.names else None)
     previous_name = guide.name(positions[:-1])
-    if node is None and previous_name is None and master_data is None:
+    if (node is None and previous_name is None and master_data is None
+            and not (board.fullmove_number <= 12 and engine_move is not None)):
         return ""
     official = master_data.get("opening") if master_data else None
     if (current_name and isinstance(official, dict)
@@ -168,7 +182,45 @@ def opening_explanation(positions: list[chess.Board], player_color: chess.Color,
 
     if waiting_for_stats:
         lines.append("Đang tra các nước từng được chơi trong ván cao thủ Lichess…")
-        return "\n".join(lines)
+
+    out_of_catalog = node is None or not node.next_moves
+    valid_engine_move = engine_move is not None and engine_move in board.legal_moves
+    if out_of_catalog and board.turn == player_color:
+        reentries = guide.reentries(board)
+        if valid_engine_move:
+            san = board.san(engine_move)
+            match = next((entry for move, entry in reentries if move == engine_move), None)
+            if match is not None:
+                target = max(match.names, key=lambda entry: len(entry[1])) if match.names else None
+                suffix = f" ({target[0]} · {target[1]})" if target else ""
+                lines.append(f"Stockfish ưu tiên {san}: {_reason(board, engine_move)}. "
+                             f"Nước này chuyển vị trở lại danh mục{suffix}.")
+            else:
+                lines.append(f"Stockfish ưu tiên {san}: {_reason(board, engine_move)}. "
+                             "Đây là kế hoạch phù hợp với thế cờ hiện tại, không tự mang nhãn Book Move.")
+            if engine_line and engine_line[0] == engine_move:
+                legal_line = []
+                continuation = board.copy(stack=False)
+                for move in engine_line[:3]:
+                    if move not in continuation.legal_moves:
+                        break
+                    legal_line.append(move)
+                    continuation.push(move)
+                if len(legal_line) >= 2:
+                    lines.append("Một phản hồi có thể xảy ra nếu hai bên chơi chính xác: "
+                                 + board.variation_san(legal_line) + ".")
+        else:
+            lines.append("Đang chờ Stockfish kiểm tra nước phù hợp với vị trí hiện tại.")
+        other_reentries = [(move, entry) for move, entry in reentries if move != engine_move]
+        if other_reentries:
+            names = ", ".join(board.san(move) for move, _ in other_reentries[:3])
+            lines.append(f"Có đường chuyển vị trực tiếp về danh mục qua {names}; "
+                         "đó là các nước hợp lệ, chưa được xác nhận là nước mạnh nhất.")
+        elif not reentries:
+            lines.append("Chưa có nước hợp lệ nào chuyển ngay về danh mục; "
+                         "hãy giữ nguyên tắc phát triển quân, tranh trung tâm và bảo vệ vua.")
+    elif out_of_catalog and board.turn != player_color:
+        lines.append("Đến lượt đối phương. Bruno sẽ cập nhật kế hoạch của bạn sau nước họ đi thật.")
 
     choices = guide.continuations(board, 100)
     master_moves: dict[str, dict] = {}
@@ -195,7 +247,7 @@ def opening_explanation(positions: list[chess.Board], player_color: chess.Color,
                     choices.append((move, 0))
     choices = choices[:3]
     if not choices:
-        if master_data is not None:
+        if master_data is not None and not (out_of_catalog and valid_engine_move):
             lines.append("Cơ sở ván cao thủ cũng chưa có đủ dữ liệu cho vị trí này; "
                          "Bruno không đoán nước tiếp theo.")
         return "\n".join(lines)
