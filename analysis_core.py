@@ -40,7 +40,9 @@ BOOK_POSITIONS = _load_book()
 
 
 def open_engine(path: str) -> chess.engine.SimpleEngine:
-    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    # Let the UI keep responding while a full-strength search uses every core.
+    options = {"creationflags": (subprocess.CREATE_NO_WINDOW |
+                                  subprocess.BELOW_NORMAL_PRIORITY_CLASS)} if os.name == "nt" else {}
     return chess.engine.SimpleEngine.popen_uci(path, **options)
 
 

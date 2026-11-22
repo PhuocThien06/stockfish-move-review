@@ -244,6 +244,8 @@ class ChessReviewApp:
         self.overview_executor = ThreadPoolExecutor(max_workers=1)
         self.sync_executor = ThreadPoolExecutor(max_workers=1)
         self.opening_executor = ThreadPoolExecutor(max_workers=2)
+        self.opening_guide_future = self.opening_executor.submit(get_opening_guide)
+        self.opening_guide_ready = False
         self.opening_results: queue.Queue[tuple[int, Future]] = queue.Queue()
         self.opening_cache: dict[int, dict | None] = {}
         self.opening_pending: set[int] = set()
@@ -269,6 +271,7 @@ class ChessReviewApp:
         self.stats_generation = 0
         self.future: Future | None = None
         self.analysis_cancel: threading.Event | None = None
+        self.analysis_job: str | None = None
         self.generation = 0
         self.analysis_cache: dict[tuple[int, bool], dict] = {}
         self.score_cache: dict[int, tuple[chess.engine.Score | None, float]] = {}
@@ -1133,7 +1136,10 @@ class ChessReviewApp:
         except OSError as exc:
             save_error = exc
         if not self.live_branch_active:
-            self._fill_moves()
+            if self.move_list.size() == len(self.moves) - 1:
+                self._update_move_row(len(self.moves) - 1)
+            else:
+                self._fill_moves()
             if was_at_live_end:
                 self._refresh()
             elif self.ply:
@@ -1619,21 +1625,39 @@ class ChessReviewApp:
 
     def _fill_moves(self) -> None:
         self.move_list.delete(0, "end")
-        for index, move in enumerate(self.moves):
-            board = self.positions[index]
-            prefix = f"{board.fullmove_number}{'.' if board.turn else '...'}"
-            category = (self.overview_assessments.get(index + 1, {}).get("category")
-                        or self.analysis_cache.get((index + 1, False), {}).get("category"))
-            label = f"  ·  {LABELS[category][0]}" if category in LABELS else ""
-            self.move_list.insert("end", f"{prefix} {board.san(move)}{label}")
-            if category in LABELS:
-                self.move_list.itemconfigure(index, foreground=text_color(category))
-            if self.original_review_state is not None and self.variation_start_ply is not None:
-                if index >= self.variation_start_ply:
-                    self.move_list.itemconfigure(index, foreground="#f2c66e")
+        for index in range(len(self.moves)):
+            self._update_move_row(index)
         if self.review_stage == "step" and self.ply:
             self.move_list.selection_set(self.ply - 1)
             self.move_list.see(self.ply - 1)
+
+    def _update_move_row(self, index: int) -> None:
+        if not 0 <= index < len(self.moves):
+            return
+        board = self.positions[index]
+        prefix = f"{board.fullmove_number}{'.' if board.turn else '...'}"
+        category = (self.overview_assessments.get(index + 1, {}).get("category")
+                    or self.analysis_cache.get((index + 1, False), {}).get("category"))
+        label = f"  ·  {LABELS[category][0]}" if category in LABELS else ""
+        row = f"{prefix} {board.san(self.moves[index])}{label}"
+        size = self.move_list.size()
+        if index < size:
+            if self.move_list.get(index) != row:
+                selected = index in self.move_list.curselection()
+                self.move_list.delete(index)
+                self.move_list.insert(index, row)
+                if selected:
+                    self.move_list.selection_set(index)
+        elif index == size:
+            self.move_list.insert("end", row)
+        else:
+            self._fill_moves()
+            return
+        color = text_color(category) if category in LABELS else "#f2eee8"
+        if (self.original_review_state is not None and self.variation_start_ply is not None
+                and index >= self.variation_start_ply):
+            color = "#f2c66e"
+        self.move_list.itemconfigure(index, foreground=color)
 
     def _select_move(self, _event: tk.Event) -> None:
         selection = self.move_list.curselection()
@@ -1699,6 +1723,9 @@ class ChessReviewApp:
         self.drag_item = None
 
     def _reset_analysis_cache(self, *, reset_bar: bool = False) -> None:
+        if self.analysis_job is not None:
+            self.root.after_cancel(self.analysis_job)
+            self.analysis_job = None
         self.generation += 1
         self._cancel_current_analysis()
         self.analysis_cache.clear()
@@ -2247,14 +2274,20 @@ class ChessReviewApp:
             self.coach_tip_var.set(f"Bruno: {san} — {reactions[category]}")
 
     def _refresh(self) -> None:
+        if self.analysis_job is not None:
+            self.root.after_cancel(self.analysis_job)
+            self.analysis_job = None
+        self.generation += 1
+        self._cancel_current_analysis()
         self.selected_square = None
-        self._render_board()
-        self._refresh_opening_guide()
+        cached = self.analysis_cache.get((self.ply, self.full))
+        if cached is None:
+            self._render_board()
+            self._refresh_opening_guide()
         self.move_list.selection_clear(0, "end")
         if self.ply:
             self.move_list.selection_set(self.ply - 1)
             self.move_list.see(self.ply - 1)
-        cached = self.analysis_cache.get((self.ply, self.full))
         overview = self.overview_assessments.get(self.ply) if self.reviewing else None
         if self.review_stage == "step":
             if self.ply:
@@ -2285,13 +2318,20 @@ class ChessReviewApp:
             self._set_grade_badge(None)
             self.detail_var.set("")
             self._set_coach_mood("")
-        self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
+        if cached is None:
+            self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
         if self.live_tracker is not None and self.live_turn_uncertain and not self.live_branch_active:
             self.grade_var.set("Chưa rõ lượt đi")
             self._set_grade_badge(None)
             self.detail_var.set("Vị trí quân đã cập nhật từ ảnh; chờ nước tiếp theo để xác định lượt.")
             self.status_var.set("")
             return
+        if cached is None:
+            self.status_var.set("Đang đánh giá nước vừa đi…" if self.ply else "Đang đánh giá vị trí…")
+            self.analysis_job = self.root.after(80, self._run_scheduled_analysis)
+
+    def _run_scheduled_analysis(self) -> None:
+        self.analysis_job = None
         self._request_analysis()
 
     def _refresh_opening_guide(self) -> None:
@@ -2300,9 +2340,16 @@ class ChessReviewApp:
         if self.live_tracker is None or self.review_stage == "overview":
             self.opening_frame.pack_forget()
             return
+        if not self.opening_guide_future.done():
+            self.opening_text.configure(state="normal")
+            self.opening_text.delete("1.0", "end")
+            self.opening_text.insert("1.0", "Bruno đang nạp danh mục khai cuộc…")
+            self.opening_text.configure(state="disabled")
+            self.opening_frame.pack(fill="x", pady=(2, 8), before=self.detail_area)
+            return
         try:
             board = self.positions[self.ply]
-            guide = get_opening_guide()
+            guide = self.opening_guide_future.result()
             key = guide.key(board)
             in_opening = guide.node(board) or (
                 board.fullmove_number <= 12 and guide.name(self.positions[:self.ply])
@@ -2334,6 +2381,10 @@ class ChessReviewApp:
         self.opening_frame.pack(fill="x", pady=(2, 8), before=self.detail_area)
 
     def _poll_opening_results(self) -> None:
+        if not self.opening_guide_ready and self.opening_guide_future.done():
+            self.opening_guide_ready = True
+            if self.live_tracker is not None:
+                self._refresh_opening_guide()
         try:
             while True:
                 key, future = self.opening_results.get_nowait()
@@ -2509,6 +2560,9 @@ class ChessReviewApp:
             self.bar_job = self.root.after(16, self._animate_bar)
 
     def _request_analysis(self) -> None:
+        if self.analysis_job is not None:
+            self.root.after_cancel(self.analysis_job)
+            self.analysis_job = None
         self.generation += 1
         generation = self.generation
         self._cancel_current_analysis()
@@ -2566,7 +2620,7 @@ class ChessReviewApp:
                 self.score_cache[self.ply] = (result["score"], result["white_ep"])
                 self._display_analysis(result)
                 if self.live_tracker is not None:
-                    self._fill_moves()
+                    self._update_move_row(self.ply - 1)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_results)
@@ -2858,6 +2912,9 @@ class ChessReviewApp:
 
     def _close(self) -> None:
         self._stop_live_capture()
+        if self.analysis_job is not None:
+            self.root.after_cancel(self.analysis_job)
+            self.analysis_job = None
         if self.bar_job is not None:
             self.root.after_cancel(self.bar_job)
             self.bar_job = None
@@ -2866,6 +2923,10 @@ class ChessReviewApp:
         self.overview_cancel.set()
         self._stop_autoplay()
         self._cancel_current_analysis()
+        # Polling callbacks are registered with Tk; cancel them before their
+        # Python commands disappear with the window.
+        for job in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+            self.root.after_cancel(job)
         self.executor.submit(self.analysis_engine.close)
         self.executor.shutdown(wait=False)
         self.stats_executor.shutdown(wait=False, cancel_futures=True)
