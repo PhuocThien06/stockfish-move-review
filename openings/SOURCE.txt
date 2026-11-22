@@ -1,5 +1,9 @@
-Opening-position index compiled from lichess-org/chess-openings (a.tsv to e.tsv).
+Opening-position index and opening guide sourced from lichess-org/chess-openings (a.tsv to e.tsv).
 Source: https://github.com/lichess-org/chess-openings
 License: CC0 1.0 / public domain, as stated by the source project.
+The source/*.tsv files are pinned to commit 48a8c0e733facfdc9a3723fe882e51ec28014074.
 Each 64-bit value is a Polyglot Zobrist hash of a position along a listed
-opening line. This local file is used only to label conventional book moves.
+opening line. book_positions.bin is used to label conventional book moves.
+The guide reads source/*.tsv to show opening names and possible continuations.
+When connected, anonymous position counts come from https://explorer.lichess.org/masters
+(Lichess Opening Explorer); no username or full PGN is sent.

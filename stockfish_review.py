@@ -37,6 +37,7 @@ from live_capture import (LiveBoardTracker, WindowCaptureStream, align_board,
                           board_crop, infer_turn, recognize_board, reduce_glare,
                           visible_windows)
 from material import DISPLAY_ORDER, material_snapshot
+from opening_guide import fetch_master_opening, get_opening_guide, opening_explanation
 
 
 PIECES = {
@@ -242,6 +243,10 @@ class ChessReviewApp:
         self.stats_executor = ThreadPoolExecutor(max_workers=1)
         self.overview_executor = ThreadPoolExecutor(max_workers=1)
         self.sync_executor = ThreadPoolExecutor(max_workers=1)
+        self.opening_executor = ThreadPoolExecutor(max_workers=2)
+        self.opening_results: queue.Queue[tuple[int, Future]] = queue.Queue()
+        self.opening_cache: dict[int, dict | None] = {}
+        self.opening_pending: set[int] = set()
         self.sync_events: queue.Queue = queue.Queue()
         self.sync_future: Future | None = None
         self.user_acted = False
@@ -323,6 +328,7 @@ class ChessReviewApp:
         self.root.after(100, self._poll_stats)
         self.root.after(100, self._poll_overview)
         self.root.after(100, self._poll_sync)
+        self.root.after(150, self._poll_opening_results)
         self.root.after(400, self._sync_games_on_start)
         self.root.after(24 * 60 * 60 * 1000, self._cleanup_tick)
         self.root.bind("<Left>", lambda _event: self._go_to(self.ply - 1))
@@ -436,6 +442,17 @@ class ChessReviewApp:
         ttk.Button(controls, text="Lật bàn", command=self._flip).pack(side="left", padx=4)
         self.review_button = ttk.Button(controls, text="Xem lại", command=self._review_manual, state="disabled")
         self.review_button.pack(side="left", padx=4)
+
+        self.opening_frame = ttk.LabelFrame(self.analysis_panel, text="Bruno · Hướng dẫn khai cuộc", padding=8)
+        self.opening_text = tk.Text(self.opening_frame, height=9, wrap="word",
+                                    font=("Segoe UI", 10), state="disabled",
+                                    bg="#302d29", fg="#f2eee8", borderwidth=0,
+                                    highlightthickness=0)
+        opening_scrollbar = ttk.Scrollbar(self.opening_frame, orient="vertical",
+                                           command=self.opening_text.yview)
+        self.opening_text.configure(yscrollcommand=opening_scrollbar.set)
+        self.opening_text.pack(side="left", fill="x", expand=True)
+        opening_scrollbar.pack(side="right", fill="y")
 
         self.detail_area = ttk.Frame(self.analysis_panel)
         self.detail_area.pack(fill="both", expand=True)
@@ -1150,6 +1167,7 @@ class ChessReviewApp:
             f"Đã dừng theo dõi · {count} nước; PGN lưu tại D:\\Chess\\data\\games."
             if saved else f"Đã dừng theo dõi · {count} nước; chưa có PGN của đoạn này."
         )
+        self._refresh_opening_guide()
 
     def _analysis_settings_changed(self, _event: tk.Event) -> None:
         self.analysis_cache = {
@@ -2231,6 +2249,7 @@ class ChessReviewApp:
     def _refresh(self) -> None:
         self.selected_square = None
         self._render_board()
+        self._refresh_opening_guide()
         self.move_list.selection_clear(0, "end")
         if self.ply:
             self.move_list.selection_set(self.ply - 1)
@@ -2274,6 +2293,55 @@ class ChessReviewApp:
             self.status_var.set("")
             return
         self._request_analysis()
+
+    def _refresh_opening_guide(self) -> None:
+        if not hasattr(self, "opening_frame"):
+            return
+        if self.live_tracker is None or self.review_stage == "overview":
+            self.opening_frame.pack_forget()
+            return
+        try:
+            board = self.positions[self.ply]
+            guide = get_opening_guide()
+            key = guide.key(board)
+            if guide.node(board) and key not in self.opening_cache and key not in self.opening_pending:
+                self.opening_pending.add(key)
+                future = self.opening_executor.submit(fetch_master_opening, board.copy(stack=False))
+                future.add_done_callback(lambda finished, position=key:
+                                         self.opening_results.put((position, finished)))
+            message = opening_explanation(
+                self.positions[:self.ply + 1], chess.BLACK if self.flipped else chess.WHITE,
+                turn_known=not (self.live_turn_uncertain and not self.live_branch_active),
+                guide=guide, master_data=self.opening_cache.get(key),
+            )
+            if key in self.opening_pending and not self.live_turn_uncertain:
+                message = message.split("\nĐến lượt", 1)[0] + "\nĐang tra tần suất nước đi từ Lichess…"
+        except (OSError, ValueError):
+            message = ""
+        if not message:
+            self.opening_frame.pack_forget()
+            return
+        self.opening_text.configure(state="normal")
+        self.opening_text.delete("1.0", "end")
+        self.opening_text.insert("1.0", message)
+        self.opening_text.configure(state="disabled")
+        self.opening_frame.pack(fill="x", pady=(2, 8), before=self.detail_area)
+
+    def _poll_opening_results(self) -> None:
+        try:
+            while True:
+                key, future = self.opening_results.get_nowait()
+                self.opening_pending.discard(key)
+                try:
+                    self.opening_cache[key] = future.result()
+                except Exception:
+                    self.opening_cache[key] = None
+                if (self.live_tracker is not None and self.positions
+                        and get_opening_guide().key(self.positions[self.ply]) == key):
+                    self._refresh_opening_guide()
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_opening_results)
 
     def _render_board(self) -> None:
         self.board_canvas.delete("all")
@@ -2795,6 +2863,7 @@ class ChessReviewApp:
         self.stats_executor.shutdown(wait=False, cancel_futures=True)
         self.overview_executor.shutdown(wait=False, cancel_futures=True)
         self.sync_executor.shutdown(wait=False, cancel_futures=True)
+        self.opening_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 
