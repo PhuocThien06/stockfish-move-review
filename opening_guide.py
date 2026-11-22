@@ -116,39 +116,58 @@ def _reason(board: chess.Board, move: chess.Move) -> str:
 def opening_explanation(positions: list[chess.Board], player_color: chess.Color,
                         guide: OpeningGuide | None = None,
                         turn_known: bool = True,
-                        master_data: dict | None = None) -> str:
+                        master_data: dict | None = None,
+                        waiting_for_stats: bool = False) -> str:
     """Explain a known opening position without claiming to know a player's intent."""
     if not positions:
         return ""
     guide = guide or get_opening_guide()
     board = positions[-1]
     node = guide.node(board)
-    match = guide.name(positions)
-    if node is None and match is None:
+    current_name = (max(node.names, key=lambda entry: len(entry[1]))
+                    if node and node.names else None)
+    previous_name = guide.name(positions[:-1])
+    if node is None and previous_name is None and master_data is None:
         return ""
     official = master_data.get("opening") if master_data else None
-    if isinstance(official, dict) and official.get("eco") and official.get("name"):
-        match = (official["eco"], official["name"])
-    if match:
-        lines = [f"Khai cuộc nhận diện: {match[0]} · {match[1]}."]
-        if not node or not node.names:
-            lines.append("Ván đã rời vị trí được đặt tên gần nhất; chưa có nước tiếp theo trong danh mục.")
+    if (current_name and isinstance(official, dict)
+            and official.get("eco") and official.get("name")):
+        current_name = (official["eco"], official["name"])
+    if current_name:
+        lines = [f"Vị trí hiện tại khớp danh mục: {current_name[0]} · {current_name[1]}."]
+        if board.fullmove_number <= 3:
+            lines.append("Mới có vài nước: đây là tên của vị trí, chưa thể biết ý định khai cuộc của đối phương.")
+    elif node and previous_name:
+        lines = [f"Tên được nhận diện gần nhất: {previous_name[0]} · {previous_name[1]}. "
+                 "Vị trí mới có trong danh mục nhưng chưa có tên biến thể riêng."]
+    elif node:
+        lines = ["Vị trí này nằm trong danh mục, nhưng còn quá sớm để xác định tên khai cuộc."]
+    elif previous_name:
+        lines = [f"Tên ở vị trí trước: {previous_name[0]} · {previous_name[1]}. "
+                 "Vị trí hiện tại không còn trong danh mục khai cuộc cục bộ."]
     else:
-        lines = ["Chưa đủ nước để xác định tên khai cuộc; bàn cờ vẫn ở một nhánh có trong danh mục."]
+        lines = ["Chưa xác định được tên khai cuộc từ vị trí này."]
 
     if len(positions) > 1 and board.move_stack:
         previous = positions[-2]
         last_move = board.move_stack[-1]
         if last_move in previous.legal_moves:
             actor = "Bạn" if board.turn != player_color else "Đối phương"
-            previous_name = guide.name(positions[:-1])
-            change = ("; vị trí chuyển sang nhánh trên"
-                      if match and match != previous_name else "; vẫn trong hướng khai cuộc này")
-            lines.append(f"{actor} vừa đi {previous.san(last_move)}{change}.")
+            lines.append(f"{actor} vừa đi {previous.san(last_move)}.")
+    if node is None:
+        lines.append("Nước vừa đi có thể vẫn thuộc giai đoạn khai cuộc, nhưng không khớp "
+                     "danh mục này; tên cũ không phải tên của thế cờ hiện tại.")
+    elif not node.next_moves:
+        lines.append("Danh mục dừng tại vị trí này. Nước tiếp theo sẽ không tự mang nhãn "
+                     "Book Move, trừ khi chuyển vị vào một thế cờ đã được ghi lại.")
 
     if not turn_known:
         lines.append("Đã nhận diện quân, nhưng chưa xác định được bên tới lượt. "
                      "Bruno sẽ nêu nước tiếp theo khi ảnh cho biết lượt đi.")
+        return "\n".join(lines)
+
+    if waiting_for_stats:
+        lines.append("Đang tra các nước từng được chơi trong ván cao thủ Lichess…")
         return "\n".join(lines)
 
     choices = guide.continuations(board, 100)
@@ -165,13 +184,27 @@ def opening_explanation(positions: list[chess.Board], player_color: chess.Color,
                 master_moves.get(pair[0].uci(), {}).get(key, 0)
                 for key in ("white", "draws", "black")
             ), reverse=True)
+        else:
+            for item in master_data.get("moves", []):
+                try:
+                    move = board.parse_san(item["san"])
+                except (KeyError, ValueError):
+                    continue
+                games = sum(item.get(key, 0) for key in ("white", "draws", "black"))
+                if games:
+                    choices.append((move, 0))
     choices = choices[:3]
     if not choices:
+        if master_data is not None:
+            lines.append("Cơ sở ván cao thủ cũng chưa có đủ dữ liệu cho vị trí này; "
+                         "Bruno không đoán nước tiếp theo.")
         return "\n".join(lines)
+    source = ("danh mục" if node and node.next_moves
+              else "ván cao thủ (chưa chắc là Book Move)")
     if board.turn == player_color:
-        lines.append("Đến lượt bạn. Các hướng có trong danh mục:")
+        lines.append(f"Đến lượt bạn. Các hướng từ {source}:")
     else:
-        lines.append("Đến lượt đối phương. Các hướng họ có thể chọn trong danh mục:")
+        lines.append(f"Đến lượt đối phương. Các hướng họ có thể chọn từ {source}:")
     for move, count in choices:
         san = board.san(move)
         item = master_moves.get(move.uci())

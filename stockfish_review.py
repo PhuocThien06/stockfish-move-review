@@ -2304,7 +2304,10 @@ class ChessReviewApp:
             board = self.positions[self.ply]
             guide = get_opening_guide()
             key = guide.key(board)
-            if guide.node(board) and key not in self.opening_cache and key not in self.opening_pending:
+            in_opening = guide.node(board) or (
+                board.fullmove_number <= 12 and guide.name(self.positions[:self.ply])
+            )
+            if in_opening and key not in self.opening_cache and key not in self.opening_pending:
                 self.opening_pending.add(key)
                 future = self.opening_executor.submit(fetch_master_opening, board.copy(stack=False))
                 future.add_done_callback(lambda finished, position=key:
@@ -2313,9 +2316,8 @@ class ChessReviewApp:
                 self.positions[:self.ply + 1], chess.BLACK if self.flipped else chess.WHITE,
                 turn_known=not (self.live_turn_uncertain and not self.live_branch_active),
                 guide=guide, master_data=self.opening_cache.get(key),
+                waiting_for_stats=key in self.opening_pending,
             )
-            if key in self.opening_pending and not self.live_turn_uncertain:
-                message = message.split("\nĐến lượt", 1)[0] + "\nĐang tra tần suất nước đi từ Lichess…"
         except (OSError, ValueError):
             message = ""
         if not message:

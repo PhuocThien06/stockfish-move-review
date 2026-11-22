@@ -47,6 +47,29 @@ class OpeningGuideTests(unittest.TestCase):
         board = chess.Board("4k3/8/8/8/8/8/8/4K3 w - - 0 40")
         self.assertEqual("", opening_explanation([board], chess.WHITE))
 
+    def test_nh3_after_kings_pawn_game_does_not_claim_current_opening(self):
+        positions = play("e4", "e5", "Nh3")
+        explanation = opening_explanation(positions, chess.BLACK, master_data={"moves": []})
+        self.assertIn("Tên ở vị trí trước", explanation)
+        self.assertIn("Đối phương vừa đi Nh3", explanation)
+        self.assertIn("không còn trong danh mục", explanation)
+        self.assertIn("không đoán nước tiếp theo", explanation)
+        self.assertNotIn("vẫn trong hướng khai cuộc", explanation)
+
+    def test_named_line_can_end_after_two_moves(self):
+        positions = play("e4", "c5", "Nh3")
+        explanation = opening_explanation(positions, chess.BLACK)
+        self.assertIn("Sicilian Defense: Brick Variation", explanation)
+        self.assertIn("Mới có vài nước", explanation)
+        self.assertIn("Danh mục dừng tại vị trí này", explanation)
+
+    def test_off_catalog_master_moves_are_not_called_book_moves(self):
+        positions = play("e4", "e5", "Nh3")
+        data = {"moves": [{"san": "Nf6", "white": 2, "draws": 1, "black": 3}]}
+        explanation = opening_explanation(positions, chess.BLACK, master_data=data)
+        self.assertIn("• Nf6", explanation)
+        self.assertIn("chưa chắc là Book Move", explanation)
+
 
 if __name__ == "__main__":
     unittest.main()
