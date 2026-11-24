@@ -16,13 +16,19 @@
    ```
 
 3. Tải Stockfish cho Windows từ [trang chính thức](https://stockfishchess.org/download/), giải nén và đặt bản chạy tại `D:\Chess\engine\stockfish.exe`. Stockfish chạy ẩn ở nền. Nếu tệp ở đường dẫn khác, bấm **Chọn tệp…** trong ứng dụng.
-4. Nhấp đúp `run.bat`, hoặc chạy:
+4. Chạy một lần lệnh dưới đây để tạo biểu tượng **Stockfish Review** trên Desktop, sau đó nhấp đúp biểu tượng ấy để mở ứng dụng:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File D:\Chess\install_desktop_shortcut.ps1
+   ```
+
+   Nếu không dùng lối tắt, bạn vẫn có thể nhấp đúp `run.bat` hoặc chạy:
 
    ```powershell
    .\.venv\Scripts\python.exe stockfish_review.py
    ```
 
-Để tạo biểu tượng **Stockfish Review** trên Desktop, chạy một lần `powershell -ExecutionPolicy Bypass -File D:\Chess\install_desktop_shortcut.ps1`. Lối tắt dùng biểu tượng quân mã màu xanh và mở ứng dụng trực tiếp từ ổ D; chương trình và dữ liệu vẫn nằm trong `D:\Chess`.
+Lối tắt dùng biểu tượng quân mã màu xanh và mở ứng dụng trực tiếp từ ổ D; chương trình và dữ liệu vẫn nằm trong `D:\Chess`. Bản thân tệp `.bat` mang biểu tượng mặc định của Windows.
 
 Bàn cờ, quân và thanh đánh giá tự đổi kích thước theo cửa sổ khi chuyển giữa màn hình laptop và màn hình rời. Nếu cửa sổ đang phóng to, hãy kéo sang màn hình kia rồi phóng to lại để Windows dùng đúng vùng hiển thị của màn hình đó.
 
