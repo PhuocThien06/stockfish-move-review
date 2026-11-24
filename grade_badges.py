@@ -102,7 +102,7 @@ def draw_badge(canvas: tk.Canvas, code: str | None, size: int, *,
 
 
 def make_badge(parent: tk.Misc, code: str | None, size: int = 30) -> tk.Canvas:
-    badge = tk.Canvas(parent, width=size, height=size, bg="#211f1c",
+    badge = tk.Canvas(parent, width=size, height=size, bg="#292b25",
                       highlightthickness=0, borderwidth=0)
     draw_badge(badge, code, size)
     return badge

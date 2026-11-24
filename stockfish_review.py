@@ -26,6 +26,8 @@ except ImportError:
     messagebox.showerror("Thiếu thư viện", "Cài python-chess bằng lệnh:\npython -m pip install python-chess")
     raise SystemExit(2)
 
+from PIL import Image, ImageTk
+
 from analysis_core import (
     EngineSession, LABELS, assess_move, configure_engine, open_engine, score_text,
 )
@@ -202,24 +204,34 @@ def compute_overview(
 
 class ChessReviewApp:
     def __init__(self, root: tk.Tk) -> None:
+        global SQUARE, BOARD_SIZE
         self.root = root
         self.root.title("Stockfish · Đánh giá nước đi")
         self.root.geometry("1220x770")
         self.root.minsize(1080, 680)
         if sys.platform == "win32":
             self.root.state("zoomed")
+        SQUARE = max(56, min(88, (self.root.winfo_screenheight() - 220) // 8,
+                             (self.root.winfo_screenwidth() - 560) // 8))
+        BOARD_SIZE = 8 * SQUARE
+        self.header_icon = None
+        icon_folder = Path(__file__).resolve().parent / "assets"
+        icon_png = icon_folder / "stockfish_review.png"
+        if icon_png.is_file():
+            with Image.open(icon_png) as source:
+                icon = source.convert("RGBA")
+                self.header_icon = ImageTk.PhotoImage(icon.resize((38, 38), Image.Resampling.LANCZOS))
+                self.window_icon = ImageTk.PhotoImage(icon.resize((64, 64), Image.Resampling.LANCZOS))
+            self.root.iconphoto(True, self.window_icon)
+        icon_ico = icon_folder / "stockfish_review.ico"
+        if sys.platform == "win32" and icon_ico.is_file():
+            self.root.iconbitmap(default=str(icon_ico))
         self._set_style()
-        piece_folder = Path(__file__).resolve().parent / "pieces"
-        self.piece_images = {
-            (color, piece): tk.PhotoImage(file=str(piece_folder / f"{color}{piece}.png"))
-            for color in "wb" for piece in "KQRBNP"
-            if (piece_folder / f"{color}{piece}.png").is_file()
-        }
-        self.capture_icons = {
-            (color, piece): image.subsample(4, 4)
-            for (color, piece), image in self.piece_images.items()
-            if piece in "PNBRQ"
-        }
+        self.piece_folder = Path(__file__).resolve().parent / "pieces"
+        self.piece_images = {}
+        self.capture_icons = {}
+        self._load_piece_images()
+        piece_folder = self.piece_folder
         self.coach_images: dict[str, dict[str, tk.PhotoImage]] = {}
         for mood, filename in (
             ("neutral", "bruno_coach.png"),
@@ -232,8 +244,8 @@ class ChessReviewApp:
                 source = tk.PhotoImage(file=str(asset))
                 self.coach_images[mood] = {
                     "tip": source.subsample(24, 24),
-                    "overview": source.subsample(16, 16),
-                    "popup": source.subsample(9, 9),
+                    "overview": source.subsample(12, 12),
+                    "popup": source.subsample(10, 10),
                 }
         self.coach_mood = "neutral"
         self.coach_panel: ttk.Frame | None = None
@@ -325,7 +337,10 @@ class ChessReviewApp:
         self.bar_orientation_var = tk.StringVar(value="Thanh đánh giá: Đen ở trên, Trắng ở dưới")
         self.game_var = tk.StringVar(value="")
         self.live_status_var = tk.StringVar(value="Chọn cửa sổ và vùng bàn cờ trước khi bắt đầu ván.")
+        self.fit_job: str | None = None
         self._build_ui()
+        self.root.bind("<Configure>", self._schedule_board_fit, add="+")
+        self.fit_job = self.root.after(100, self._fit_board_to_window)
         self._render_board()
         self._draw_bar(None)
         self.root.after(100, self._poll_results)
@@ -341,75 +356,147 @@ class ChessReviewApp:
         self.root.bind("<End>", lambda _event: self._go_to(len(self.moves)))
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
+    def _load_piece_images(self) -> None:
+        """Keep the Neo sprites sharp as the board changes size."""
+        self.piece_images = {}
+        for color in "wb":
+            for piece in "KQRBNP":
+                path = self.piece_folder / f"{color}{piece}.png"
+                if not path.is_file():
+                    continue
+                with Image.open(path) as source:
+                    sprite = source.convert("RGBA")
+                    self.piece_images[(color, piece)] = ImageTk.PhotoImage(
+                        sprite.resize((SQUARE, SQUARE), Image.Resampling.LANCZOS)
+                    )
+                    if piece in "PNBRQ" and (color, piece) not in self.capture_icons:
+                        self.capture_icons[(color, piece)] = ImageTk.PhotoImage(
+                            sprite.resize((18, 18), Image.Resampling.LANCZOS)
+                        )
+
+    def _schedule_board_fit(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        if self.fit_job is not None:
+            self.root.after_cancel(self.fit_job)
+        self.fit_job = self.root.after(120, self._fit_board_to_window)
+
+    def _fit_board_to_window(self) -> None:
+        """Resize only visual widgets when a window moves or changes monitors."""
+        global SQUARE, BOARD_SIZE
+        self.fit_job = None
+        width = self.main_container.winfo_width()
+        height = self.main_container.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        board_height = height - 26 - 20 - 76
+        board_width = width - 28 - 20 - 14 - 48 - 500
+        square = max(44, min(120, board_height // 8, board_width // 8))
+        if square == SQUARE:
+            return
+        if self.drag_item is not None:
+            self.fit_job = self.root.after(120, self._fit_board_to_window)
+            return
+        SQUARE = square
+        BOARD_SIZE = 8 * square
+        self._load_piece_images()
+        self.board_canvas.configure(width=BOARD_SIZE, height=BOARD_SIZE)
+        self.bar.configure(height=BOARD_SIZE)
+        self.top_material.configure(width=BOARD_SIZE + 50)
+        self.bottom_material.configure(width=BOARD_SIZE + 50)
+        right_width = width - (BOARD_SIZE + 48 + 20 + 28 + 14)
+        self.review_sidebar.configure(width=max(270, min(350, right_width // 2)))
+        self._render_board()
+        self._draw_bar(*self.score_cache.get(self.ply, (None, 0.5)))
+
     def _set_style(self) -> None:
-        self.root.configure(bg="#211f1c")
+        self.root.configure(bg="#1b1e1a")
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TFrame", background="#211f1c")
-        style.configure("TLabel", background="#211f1c", foreground="#ede9e1",
+        style.configure("TFrame", background="#292b25")
+        style.configure("Main.TFrame", background="#1b1e1a")
+        style.configure("TLabel", background="#292b25", foreground="#eeeadd",
                         font=("Segoe UI", 10))
-        style.configure("TButton", background="#3b3833", foreground="#f5f2eb",
-                        bordercolor="#4d4943", padding=(10, 7), font=("Segoe UI", 10))
-        style.map("TButton", background=[("active", "#4b4740"), ("disabled", "#302e2a")],
-                  foreground=[("disabled", "#848078")])
-        style.configure("Accent.TButton", background="#81b64c", foreground="#101a0c",
-                        bordercolor="#81b64c", font=("Segoe UI", 10, "bold"))
-        style.map("Accent.TButton", background=[("active", "#9bcc61")])
-        style.configure("TEntry", fieldbackground="#33302c", foreground="#f5f2eb",
-                        insertcolor="#f5f2eb", bordercolor="#5a554c")
-        style.configure("TCombobox", fieldbackground="#33302c", foreground="#f5f2eb",
-                        background="#33302c")
-        style.configure("TLabelframe", background="#211f1c", bordercolor="#524c43")
-        style.configure("TLabelframe.Label", background="#211f1c", foreground="#a8d77a",
+        style.configure("Muted.TLabel", background="#292b25", foreground="#aaa99b")
+        style.configure("TButton", background="#41453b", foreground="#f3f1e9",
+                        borderwidth=0, relief="flat", padding=(13, 9),
                         font=("Segoe UI", 10, "bold"))
-        style.configure("TSeparator", background="#4a453e")
-        style.configure("Heart.TButton", background="#3b3833", foreground="#ef7484",
-                        font=("Segoe UI", 16, "bold"), padding=(8, 1))
+        style.map("TButton", background=[("active", "#535a48"), ("disabled", "#353831")],
+                  foreground=[("disabled", "#84887e")])
+        style.configure("Nav.TButton", background="#343a32", foreground="#e7ecd9",
+                        borderwidth=0, padding=(12, 10), font=("Segoe UI Symbol", 11, "bold"))
+        style.map("Nav.TButton", background=[("active", "#52694a")])
+        style.configure("Accent.TButton", background="#81b64c", foreground="#17220e",
+                        borderwidth=0, padding=(15, 10), font=("Segoe UI", 10, "bold"))
+        style.map("Accent.TButton", background=[("active", "#9bd063"),
+                                                 ("disabled", "#45543b")])
+        style.configure("TEntry", fieldbackground="#353930", foreground="#f5f1e6",
+                        insertcolor="#f5f1e6", bordercolor="#5a6550", padding=6)
+        style.configure("TCombobox", fieldbackground="#353930", foreground="#f5f1e6",
+                        background="#353930", bordercolor="#5a6550", padding=5)
+        style.configure("TLabelframe", background="#292b25", bordercolor="#4d5845",
+                        borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background="#292b25", foreground="#b1d87d",
+                        font=("Segoe UI", 11, "bold"))
+        style.configure("TSeparator", background="#4c5b42")
+        style.configure("Heart.TButton", background="#41453b", foreground="#ef8996",
+                        borderwidth=0, font=("Segoe UI", 16, "bold"), padding=(10, 4))
 
     def _build_ui(self) -> None:
-        heading = ttk.Frame(self.root, padding=(12, 10, 12, 0))
+        heading = ttk.Frame(self.root, padding=(18, 10, 18, 8))
         heading.pack(fill="x")
-        ttk.Label(heading, text="STOCKFISH REVIEW", font=("Segoe UI", 18, "bold"),
+        if self.header_icon is not None:
+            ttk.Label(heading, image=self.header_icon).pack(side="left", padx=(0, 10))
+        ttk.Label(heading, text="STOCKFISH REVIEW", font=("Segoe UI", 19, "bold"),
                   foreground="#a8d77a").pack(side="left")
-        top = ttk.Frame(self.root, padding=10)
+        ttk.Label(heading, text="PHÂN TÍCH CỜ VUA TRÊN MÁY",
+                  style="Muted.TLabel", font=("Segoe UI", 9, "bold")).pack(side="right")
+        top = ttk.Frame(self.root, padding=(18, 8, 18, 8))
         top.pack(fill="x")
-        ttk.Label(top, text="Stockfish:").pack(side="left")
-        ttk.Entry(top, textvariable=self.engine_var, width=48).pack(side="left", padx=5)
-        ttk.Button(top, text="Chọn tệp…", command=self._choose_engine).pack(side="left")
-        ttk.Button(top, text="Mở PGN…", command=self._open_pgn).pack(side="left", padx=(12, 0))
-        ttk.Button(top, text="Dán PGN…", command=self._paste_pgn,
-                   style="Accent.TButton").pack(side="left", padx=5)
-        ttk.Button(top, text="Ván mới", command=self._new_game).pack(side="left", padx=6)
-        ttk.Label(top, text="Tên:").pack(side="left", padx=(14, 2))
-        ttk.Entry(top, textvariable=self.username_var, width=17).pack(side="left")
-        ttk.Button(top, text="Đồng bộ", command=lambda: self._sync_games(auto_load=True)).pack(side="left", padx=4)
-        ttk.Button(top, text="Ván đã lưu", command=self._open_saved_games).pack(side="left")
+        account = ttk.Frame(top)
+        account.pack(side="right")
+        ttk.Label(account, text="TÀI KHOẢN", style="Muted.TLabel",
+                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Entry(account, textvariable=self.username_var, width=18).pack(side="left")
+        ttk.Button(account, text="Đồng bộ", style="Accent.TButton",
+                   command=lambda: self._sync_games(auto_load=True)).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Ván mới", command=self._new_game).pack(side="left")
+        ttk.Button(top, text="Mở PGN", command=self._open_pgn).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Dán PGN", command=self._paste_pgn).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Ván đã lưu", command=self._open_saved_games).pack(side="left", padx=(8, 0))
 
-        live_row = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        live_row = ttk.Frame(self.root, padding=(18, 8, 18, 9))
         live_row.pack(fill="x")
+        ttk.Label(live_row, text="ENGINE", style="Muted.TLabel",
+                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Entry(live_row, textvariable=self.engine_var, width=38).pack(side="left")
+        ttk.Button(live_row, text="Chọn tệp", command=self._choose_engine).pack(side="left", padx=(8, 14))
         self.live_button = ttk.Button(live_row, text="Theo dõi bàn cờ trên màn hình…",
-                                      command=self._open_live_capture)
+                                      command=self._open_live_capture,
+                                      style="Accent.TButton")
         self.live_button.pack(side="left")
-        ttk.Label(live_row, textvariable=self.live_status_var).pack(side="left", padx=10)
+        ttk.Label(live_row, textvariable=self.live_status_var, style="Muted.TLabel",
+                  wraplength=440).pack(side="left", padx=(12, 0), fill="x", expand=True)
 
-        main = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        main = ttk.Frame(self.root, padding=(14, 12, 14, 14), style="Main.TFrame")
         main.pack(fill="both", expand=True)
-        left = ttk.Frame(main)
+        self.main_container = main
+        left = ttk.Frame(main, padding=10)
         left.pack(side="left", fill="y")
         info_width = BOARD_SIZE + 50
         self.top_material = tk.Canvas(left, width=info_width, height=38,
-                                      bg="#2b2926", highlightthickness=0)
+                                      bg="#30372c", highlightthickness=0)
         self.top_material.pack(anchor="w")
         board_row = ttk.Frame(left)
         board_row.pack(anchor="w")
-        self.bar = tk.Canvas(board_row, width=40, height=BOARD_SIZE, highlightthickness=1,
-                             highlightbackground="#645b50", bg="#252525")
+        self.bar = tk.Canvas(board_row, width=40, height=BOARD_SIZE, highlightthickness=0,
+                             bg="#30372c")
         self.bar.pack(side="left", anchor="n", padx=(0, 8))
         self.board_canvas = tk.Canvas(board_row, width=BOARD_SIZE, height=BOARD_SIZE,
-                                      highlightthickness=1, highlightbackground="#645b50")
+                                      highlightthickness=0)
         self.board_canvas.pack(side="left", anchor="n")
         self.bottom_material = tk.Canvas(left, width=info_width, height=38,
-                                         bg="#2b2926", highlightthickness=0)
+                                         bg="#30372c", highlightthickness=0)
         self.bottom_material.pack(anchor="w")
         self.board_canvas.bind("<ButtonPress-1>", self._left_press)
         self.board_canvas.bind("<B1-Motion>", self._left_motion)
@@ -418,12 +505,12 @@ class ChessReviewApp:
         self.board_canvas.bind("<B3-Motion>", self._right_motion)
         self.board_canvas.bind("<ButtonRelease-3>", self._right_release)
 
-        right = ttk.Frame(main, padding=(14, 0, 0, 0))
-        right.pack(side="left", fill="both", expand=True)
-        game_row = ttk.Frame(right)
+        right = ttk.Frame(main, padding=(16, 13, 16, 15))
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        game_row = ttk.Frame(right, padding=(0, 0, 0, 8))
         game_row.pack(fill="x")
-        ttk.Label(game_row, textvariable=self.game_var, font=("Segoe UI", 11, "bold"),
-                  wraplength=410).pack(side="left", fill="x", expand=True)
+        ttk.Label(game_row, textvariable=self.game_var, font=("Segoe UI", 13, "bold"),
+                  foreground="#e4d3a2", wraplength=600).pack(side="left", fill="x", expand=True)
         self.favorite_button = ttk.Button(game_row, text="♡", width=3, style="Heart.TButton",
                                           command=self._toggle_favorite, state="disabled")
         self.favorite_button.pack(side="right")
@@ -436,21 +523,27 @@ class ChessReviewApp:
         ttk.Label(self.coach_tip_row, textvariable=self.coach_tip_var, wraplength=410,
                   font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
         controls = ttk.Frame(self.analysis_panel)
-        controls.pack(fill="x", pady=(8, 5))
-        ttk.Button(controls, text="|◀", width=4, command=lambda: self._go_to(0)).pack(side="left")
-        ttk.Button(controls, text="◀", width=4, command=lambda: self._go_to(self.ply - 1)).pack(side="left", padx=3)
-        self.autoplay_button = ttk.Button(controls, text="▶", width=4, command=self._toggle_autoplay)
-        self.autoplay_button.pack(side="left")
-        ttk.Button(controls, text="❯", width=4, command=lambda: self._go_to(self.ply + 1)).pack(side="left", padx=3)
-        ttk.Button(controls, text="▶|", width=4, command=lambda: self._go_to(len(self.moves))).pack(side="left")
-        ttk.Button(controls, text="Lật bàn", command=self._flip).pack(side="left", padx=4)
-        self.review_button = ttk.Button(controls, text="Xem lại", command=self._review_manual, state="disabled")
-        self.review_button.pack(side="left", padx=4)
+        controls.pack(fill="x", pady=(7, 10))
+        ttk.Button(controls, text="⏮", width=3, style="Nav.TButton",
+                   command=lambda: self._go_to(0)).pack(side="left")
+        ttk.Button(controls, text="❮", width=3, style="Nav.TButton",
+                   command=lambda: self._go_to(self.ply - 1)).pack(side="left", padx=(5, 0))
+        self.autoplay_button = ttk.Button(controls, text="▶", width=3, style="Nav.TButton",
+                                          command=self._toggle_autoplay)
+        self.autoplay_button.pack(side="left", padx=(5, 0))
+        ttk.Button(controls, text="❯", width=3, style="Nav.TButton",
+                   command=lambda: self._go_to(self.ply + 1)).pack(side="left", padx=(5, 0))
+        ttk.Button(controls, text="⏭", width=3, style="Nav.TButton",
+                   command=lambda: self._go_to(len(self.moves))).pack(side="left", padx=(5, 0))
+        ttk.Button(controls, text="Lật bàn", command=self._flip).pack(side="left", padx=(12, 0))
+        self.review_button = ttk.Button(controls, text="Xem lại", command=self._review_manual,
+                                        state="disabled", style="Accent.TButton")
+        self.review_button.pack(side="left", padx=(8, 0))
 
         self.opening_frame = ttk.LabelFrame(self.analysis_panel, text="Bruno · Hướng dẫn khai cuộc", padding=8)
         self.opening_text = tk.Text(self.opening_frame, height=9, wrap="word",
                                     font=("Segoe UI", 10), state="disabled",
-                                    bg="#302d29", fg="#f2eee8", borderwidth=0,
+                                    bg="#333a30", fg="#f1f0e9", borderwidth=0,
                                     highlightthickness=0)
         opening_scrollbar = ttk.Scrollbar(self.opening_frame, orient="vertical",
                                            command=self.opening_text.yview)
@@ -460,22 +553,28 @@ class ChessReviewApp:
 
         self.detail_area = ttk.Frame(self.analysis_panel)
         self.detail_area.pack(fill="both", expand=True)
-        self.review_sidebar = ttk.Frame(self.detail_area, width=330)
-        self.review_sidebar.pack(side="right", fill="y", padx=(10, 0))
+        self.review_sidebar = ttk.Frame(self.detail_area, width=350)
+        self.review_sidebar.pack(side="right", fill="y", padx=(12, 0))
         self.review_sidebar.pack_propagate(False)
-        self.coach_idle = ttk.LabelFrame(self.detail_area, text="Bruno · HLV cờ", padding=12)
-        self.coach_idle.pack(side="left", fill="both", expand=True)
+        self.coach_idle = ttk.LabelFrame(self.detail_area, text="Bruno · HLV cờ", padding=18)
+        self.coach_idle.pack(side="left", fill="x", expand=True, anchor="n")
         idle_header = ttk.Frame(self.coach_idle)
-        idle_header.pack(anchor="nw")
+        idle_header.pack(fill="x", anchor="n")
         self.coach_idle_image = ttk.Label(idle_header)
-        self.coach_idle_image.pack(side="left", padx=(0, 12))
-        ttk.Label(idle_header, text="Chọn một nước để Bruno giải thích trên bàn cờ.",
-                  wraplength=320).pack(side="left")
+        self.coach_idle_image.pack(anchor="center", pady=(0, 10))
+        self.coach_idle_message = ttk.Label(
+            idle_header,
+            text="Chọn một nước trong danh sách để Bruno giải thích vị trí và minh họa biến thể trên bàn cờ.",
+            wraplength=160, justify="center", font=("Segoe UI", 10))
+        self.coach_idle_message.pack(fill="x")
+        idle_header.bind("<Configure>", lambda event: self.coach_idle_message.configure(
+            wraplength=max(150, event.width - 8)))
 
         self.move_list = tk.Listbox(self.review_sidebar, height=11, font=("Consolas", 10), exportselection=False,
-                                    bg="#302d29", fg="#f2eee8", selectbackground="#729e42",
-                                    selectforeground="#ffffff", borderwidth=0, highlightthickness=0)
-        self.move_list.pack(fill="x")
+                                    bg="#30332d", fg="#f0eee7", selectbackground="#6e9850",
+                                    selectforeground="#ffffff", borderwidth=0, highlightthickness=0,
+                                    activestyle="none", selectborderwidth=0)
+        self.move_list.pack(fill="both", expand=True)
         self.move_list.bind("<<ListboxSelect>>", self._select_move)
         self.entry_row = ttk.Frame(self.analysis_panel)
         self.entry_row.pack(fill="x", pady=(8, 0), before=self.detail_area)
@@ -488,24 +587,26 @@ class ChessReviewApp:
         self.play_button.pack(side="left")
 
         self.analysis_separator = ttk.Separator(self.review_sidebar)
-        self.analysis_separator.pack(fill="x", pady=12)
+        self.analysis_separator.pack(fill="x", pady=(0, 10), before=self.move_list)
         self.grade_section = ttk.Frame(self.review_sidebar)
-        self.grade_section.pack(fill="x")
+        self.grade_section.pack(fill="x", before=self.analysis_separator)
         ttk.Label(self.grade_section, text="Đánh giá nước vừa đi", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         grade_row = ttk.Frame(self.grade_section)
         grade_row.pack(anchor="w", pady=(5, 0))
         self.grade_badge = make_badge(grade_row, None, 48)
         self.grade_label = ttk.Label(grade_row, textvariable=self.grade_var, font=("Segoe UI", 16, "bold"))
         self.grade_label.pack(side="left", padx=(6, 0))
-        ttk.Label(self.grade_section, textvariable=self.detail_var).pack(anchor="w")
-        ttk.Label(self.grade_section, textvariable=self.bar_orientation_var).pack(anchor="w", pady=(6, 0))
-        ttk.Label(self.grade_section, textvariable=self.eval_var).pack(anchor="w")
+        ttk.Label(self.grade_section, textvariable=self.detail_var, wraplength=245).pack(anchor="w")
+        ttk.Label(self.grade_section, textvariable=self.bar_orientation_var,
+                  style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(9, 0))
+        ttk.Label(self.grade_section, textvariable=self.eval_var,
+                  font=("Segoe UI", 15, "bold"), foreground="#e4d3a2").pack(anchor="w", pady=(3, 0))
 
         full_row = ttk.Frame(self.analysis_panel)
         self.full_row = full_row
-        full_row.pack(fill="x", pady=(8, 5), before=self.detail_area)
+        full_row.pack(fill="x", pady=(8, 12), before=self.detail_area)
         self.full_button = ttk.Button(full_row, text="Bật Full công suất", command=self._toggle_full,
-                                      state="disabled", style="Accent.TButton")
+                                      state="disabled")
         self.full_button.pack(side="left")
         self.stats_button = ttk.Button(full_row, text="Thống kê nâng cao", command=self._open_stats, state="disabled")
         self.stats_button.pack(side="left", padx=(7, 0))
@@ -518,10 +619,11 @@ class ChessReviewApp:
         self.seconds_combo.bind("<<ComboboxSelected>>", self._analysis_settings_changed)
         self.full_frame = ttk.LabelFrame(self.analysis_panel, text="Phân tích sâu", padding=8)
         self.full_text = tk.Text(self.full_frame, height=5, wrap="word", font=("Segoe UI", 10),
-                                 state="disabled", bg="#302d29", fg="#f2eee8",
+                                 state="disabled", bg="#333a30", fg="#f1f0e9",
                                  borderwidth=0, highlightthickness=0)
         self.full_text.pack(fill="both", expand=True)
-        self.status_label = ttk.Label(self.analysis_panel, textvariable=self.status_var, wraplength=480)
+        self.status_label = ttk.Label(self.analysis_panel, textvariable=self.status_var,
+                                      style="Muted.TLabel", wraplength=600)
         self.status_label.pack(anchor="w", pady=(10, 0))
 
         self.overview_panel = ttk.Frame(right, padding=(0, 12, 0, 0))
@@ -539,7 +641,9 @@ class ChessReviewApp:
         ttk.Label(self.overview_panel, text="PHÂN LOẠI NƯỚC ĐI", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(2, 2))
         self.overview_grid = ttk.Frame(self.overview_panel)
         self.overview_grid.pack(fill="x")
-        self.overview_grid.columnconfigure(0, minsize=210)
+        self.overview_grid.columnconfigure(0, minsize=210, weight=3)
+        self.overview_grid.columnconfigure(1, weight=1)
+        self.overview_grid.columnconfigure(2, weight=1)
         self.overview_count_vars: dict[tuple[str, str], tk.StringVar] = {}
         for col, heading in enumerate(("Nhãn", "Trắng", "Đen")):
             ttk.Label(self.overview_grid, text=heading, font=("Segoe UI", 9, "bold"),
@@ -554,7 +658,7 @@ class ChessReviewApp:
                 self.overview_count_vars[(side, code)] = variable
                 ttk.Label(self.overview_grid, textvariable=variable).grid(row=row, column=col, sticky="w")
         ttk.Label(self.overview_panel, text="DIỄN BIẾN LỢI THẾ", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 2))
-        self.overview_chart = tk.Canvas(self.overview_panel, height=45, bg="#302d29", highlightthickness=0)
+        self.overview_chart = tk.Canvas(self.overview_panel, height=90, bg="#333a30", highlightthickness=0)
         self.overview_chart.pack(fill="x")
         self.overview_start_button = ttk.Button(self.overview_panel, text="Xem lại từng nước  ▶",
                                                  command=self._start_step_review, style="Accent.TButton")
@@ -1623,7 +1727,7 @@ class ChessReviewApp:
         canvas = self.overview_chart
         canvas.delete("all")
         width = max(canvas.winfo_width(), 410)
-        height = 45
+        height = 90
         canvas.create_line(0, height / 2, width, height / 2, fill="#77716a", dash=(3, 3))
         if not self.overview_points:
             return
@@ -1917,8 +2021,10 @@ class ChessReviewApp:
         else:
             points = (x1, y1, x2, y2)
         self.board_canvas.create_line(
-            *points, fill="#efae22", width=14, joinstyle=tk.ROUND,
-            arrow=tk.LAST, arrowshape=(24, 32, 12), tags=tag,
+            *points, fill="#efae22", width=round(14 * SQUARE / 64), joinstyle=tk.ROUND,
+            arrow=tk.LAST,
+            arrowshape=tuple(round(value * SQUARE / 64) for value in (24, 32, 12)),
+            tags=tag,
         )
 
     def _enter_move(self, _event: tk.Event | None = None) -> None:
@@ -2421,13 +2527,13 @@ class ChessReviewApp:
                 file_ = 7 - col if self.flipped else col
                 rank_ = row if self.flipped else 7 - row
                 sq = chess.square(file_, rank_)
-                color = "#f0d9b5" if (file_ + rank_) % 2 else "#b58863"
+                color = "#eeeed2" if (file_ + rank_) % 2 else "#769656"
                 if previous and sq in (previous.from_square, previous.to_square):
-                    color = "#cdd26a" if (file_ + rank_) % 2 else "#a6ad55"
+                    color = "#f5f682" if (file_ + rank_) % 2 else "#baca44"
                 if sq == self.selected_square:
-                    color = "#76b7dc"
+                    color = "#8ebbbc"
                 if sq in self.marked_squares:
-                    color = "#e36b56"
+                    color = "#e87566"
                 x, y = col * SQUARE, row * SQUARE
                 self.board_canvas.create_rectangle(x, y, x + SQUARE, y + SQUARE,
                                                    fill=color, outline=color)
@@ -2457,7 +2563,7 @@ class ChessReviewApp:
                     else:
                         self.board_canvas.create_text(x + SQUARE / 2, y + SQUARE / 2,
                                                       text=PIECES[piece.symbol()],
-                                                      font=("Segoe UI Symbol", 38),
+                                                      font=("Segoe UI Symbol", round(38 * SQUARE / 64)),
                                                       fill="#171717" if piece.color == chess.BLACK else "#ffffff",
                                                       tags=f"piece_{sq}")
                 if sq in legal_targets:
@@ -2465,17 +2571,20 @@ class ChessReviewApp:
                         self.board_canvas.create_oval(x + 5, y + 5, x + SQUARE - 5,
                                                       y + SQUARE - 5, outline="#315a20", width=4)
                     else:
-                        self.board_canvas.create_oval(x + 25, y + 25, x + 39, y + 39,
+                        radius = max(7, round(SQUARE * .11))
+                        center = SQUARE / 2
+                        self.board_canvas.create_oval(x + center - radius, y + center - radius,
+                                                      x + center + radius, y + center + radius,
                                                       fill="#6f7050", outline="")
                 if col == 0:
                     self.board_canvas.create_text(x + 4, y + 4, text=str(rank_ + 1),
                                                   anchor="nw", font=("Segoe UI", 8, "bold"),
-                                                  fill="#ffffff" if (file_ + rank_) % 2 == 0 else "#333333")
+                                                  fill="#edf4d9" if (file_ + rank_) % 2 == 0 else "#64854e")
                 if row == 7:
                     self.board_canvas.create_text(x + SQUARE - 4, y + SQUARE - 3,
                                                   text=chess.FILE_NAMES[file_], anchor="se",
                                                   font=("Segoe UI", 8, "bold"),
-                                                  fill="#ffffff" if (file_ + rank_) % 2 == 0 else "#333333")
+                                                  fill="#edf4d9" if (file_ + rank_) % 2 == 0 else "#64854e")
         self._draw_board_grade()
         self._render_material()
 
@@ -2495,7 +2604,7 @@ class ChessReviewApp:
             return
         col = 7 - chess.square_file(square) if self.flipped else chess.square_file(square)
         row = chess.square_rank(square) if self.flipped else 7 - chess.square_rank(square)
-        size = 30
+        size = max(24, round(SQUARE * .4))
         center_x = max(size / 2 + 2, min(BOARD_SIZE - size / 2 - 2,
                                        (col + 1) * SQUARE - 5))
         center_y = max(size / 2 + 2, min(BOARD_SIZE - size / 2 - 2,
@@ -2562,8 +2671,8 @@ class ChessReviewApp:
             self.bar_display_share += remaining * 0.22
         self.bar.delete("all")
         bottom_height = int(BOARD_SIZE * self.bar_display_share)
-        top_color = "#f3f3f3" if self.flipped else "#252525"
-        bottom_color = "#252525" if self.flipped else "#f3f3f3"
+        top_color = "#eeeeda" if self.flipped else "#35412f"
+        bottom_color = "#35412f" if self.flipped else "#eeeeda"
         self.bar.create_rectangle(0, 0, 40, BOARD_SIZE - bottom_height,
                                   fill=top_color, outline="")
         self.bar.create_rectangle(0, BOARD_SIZE - bottom_height, 40, BOARD_SIZE,
@@ -2692,25 +2801,30 @@ class ChessReviewApp:
         self._stop_autoplay()
         self.coach_tip_row.pack_forget()
         self.coach_idle.pack_forget()
-        panel = ttk.LabelFrame(self.detail_area, text="Bruno · HLV cờ", padding=8)
+        panel = ttk.LabelFrame(self.detail_area, text="Bruno · HLV cờ", padding=14)
         panel.pack(side="left", fill="both", expand=True, before=self.review_sidebar)
         self.coach_panel = panel
         header = ttk.Frame(panel)
         header.pack(fill="x")
         popup_image_label = ttk.Label(header)
-        popup_image_label.pack(side="left", padx=(0, 10))
+        popup_image_label.pack(anchor="center", pady=(0, 4))
         current_images = self.coach_images.get(self.coach_mood)
         if current_images:
             popup_image_label.configure(image=current_images["popup"])
-        ttk.Label(header, text="Hỏi về nước vừa chọn. Mình sẽ đi từng nước trong biến thể để bạn thấy điều gì xảy ra trên bàn.",
-                  wraplength=300, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        popup_message = ttk.Label(
+            header,
+            text="Hỏi về nước vừa chọn. Mình sẽ đi từng nước trong biến thể để bạn thấy điều gì xảy ra trên bàn.",
+            wraplength=150, justify="center", font=("Segoe UI", 10))
+        popup_message.pack(fill="x")
+        header.bind("<Configure>", lambda event: popup_message.configure(
+            wraplength=max(140, event.width - 8)))
         question = tk.StringVar(value="Tại sao nước này được đánh giá như vậy?")
         entry = ttk.Entry(panel, textvariable=question)
         entry.pack(fill="x", pady=(4, 6))
         response_row = ttk.Frame(panel)
         response_row.pack(fill="both", expand=True)
-        response = tk.Text(response_row, height=8, wrap="word", font=("Segoe UI", 10),
-                           bg="#302d29", fg="#f2eee8", borderwidth=0,
+        response = tk.Text(response_row, height=6, wrap="word", font=("Segoe UI", 10),
+                           bg="#333a30", fg="#f1f0e9", borderwidth=0,
                            padx=10, pady=8)
         response.pack(side="left", fill="both", expand=True)
         response_scroll = ttk.Scrollbar(response_row, command=response.yview)
@@ -2916,14 +3030,17 @@ class ChessReviewApp:
             if panel.winfo_exists():
                 panel.destroy()
             if self.review_stage == "step":
-                self.coach_idle.pack(side="left", fill="both", expand=True,
-                                     before=self.review_sidebar)
+                self.coach_idle.pack(side="left", fill="x", expand=True,
+                                     anchor="n", before=self.review_sidebar)
 
         ttk.Button(more_buttons, text="Đóng giải thích", command=close_panel).pack(side="left", padx=6)
         self.coach_close = close_panel
 
     def _close(self) -> None:
         self._stop_live_capture()
+        if self.fit_job is not None:
+            self.root.after_cancel(self.fit_job)
+            self.fit_job = None
         if self.analysis_job is not None:
             self.root.after_cancel(self.analysis_job)
             self.analysis_job = None

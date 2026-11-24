@@ -5,10 +5,12 @@ import tempfile
 import tkinter as tk
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import chess
 
+import stockfish_review as review
 from stockfish_review import ChessReviewApp
 from local_store import load_last_username
 
@@ -64,6 +66,25 @@ class UiResponsivenessTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.app.sync_future.result()
                 self.assertEqual("EnergeticCyborg", load_last_username(games))
+
+    def test_board_and_pieces_fit_after_window_moves_between_screen_sizes(self) -> None:
+        with patch.object(self.app, "_sync_games"):
+            self.root.state("normal")
+            self.root.deiconify()
+            self.root.geometry("1120x740+60+60")
+            self.root.update()
+            self.app._fit_board_to_window()
+            laptop_square = review.SQUARE
+            self.assertEqual(chess.E4, self.app._event_square(SimpleNamespace(
+                x=4 * laptop_square + 2, y=4 * laptop_square + 2)))
+            self.root.geometry("1536x816+1920+50")
+            self.root.update()
+            self.app._fit_board_to_window()
+        self.assertGreater(review.SQUARE, laptop_square)
+        self.assertEqual(8 * review.SQUARE, int(self.app.board_canvas.cget("width")))
+        self.assertEqual(review.SQUARE, self.app.piece_images[("w", "P")].width())
+        self.assertEqual(chess.E4, self.app._event_square(SimpleNamespace(
+            x=4 * review.SQUARE + 2, y=4 * review.SQUARE + 2)))
 
 
 if __name__ == "__main__":

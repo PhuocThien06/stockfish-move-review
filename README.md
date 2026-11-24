@@ -22,6 +22,10 @@
    .\.venv\Scripts\python.exe stockfish_review.py
    ```
 
+Để tạo biểu tượng **Stockfish Review** trên Desktop, chạy một lần `powershell -ExecutionPolicy Bypass -File D:\Chess\install_desktop_shortcut.ps1`. Lối tắt dùng biểu tượng quân mã màu xanh và mở ứng dụng trực tiếp từ ổ D; chương trình và dữ liệu vẫn nằm trong `D:\Chess`.
+
+Bàn cờ, quân và thanh đánh giá tự đổi kích thước theo cửa sổ khi chuyển giữa màn hình laptop và màn hình rời. Nếu cửa sổ đang phóng to, hãy kéo sang màn hình kia rồi phóng to lại để Windows dùng đúng vùng hiển thị của màn hình đó.
+
 Tên đồng bộ mặc định là **EnergeticCyborg**. Khi bấm **Đồng bộ**, ứng dụng lưu tên vừa tìm vào `D:\Chess\data\settings.json` và tự điền lại khi mở lần sau, kể cả nếu lần tải đó gặp lỗi mạng. Khi mở ứng dụng hoặc bấm **Đồng bộ**, chương trình lấy tối đa **10 ván công khai đã kết thúc gần nhất trong 30 ngày qua**, lưu mỗi ván một lần vào `D:\Chess\data\games`, rồi mở ván mới nhất. Các ván đã lưu từ lần trước vẫn tuân theo quy tắc dọn sau 30 ngày và ngoại lệ yêu thích. Có thể sửa tên ở thanh trên cùng hoặc mở **Ván đã lưu**. Việc tải dùng các lời gọi tuần tự tới API; nếu Chess.com giới hạn truy cập, ứng dụng hiển thị lỗi và vẫn dùng được PGN trên máy. Quyền dùng API không bảo đảm tài khoản sẽ không bao giờ bị hạn chế. Theo [Fair Play của Chess.com](https://support.chess.com/en/articles/8568369-what-do-i-need-to-know-about-fair-play-on-chess-com), không dùng Stockfish để phân tích một ván trên Chess.com khi ván đó còn đang diễn ra.
 
 ## Sử dụng
