@@ -126,6 +126,46 @@ def material_offer(board: chess.Board, move: chess.Move,
     }
 
 
+def available_material_offer(board: chess.Board, move: chess.Move) -> dict | None:
+    """Find a legal acceptance of a piece offer even when the best PV declines it.
+
+    A same-square recapture that restores the material balance is an exchange,
+    not a sacrifice. This is only a board fact; the engine score decides whether
+    the offer is sound.
+    """
+    piece = board.piece_at(move.from_square)
+    if (piece is None or piece.piece_type not in
+            (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+            or move not in board.legal_moves):
+        return None
+    before_balance = _material_balance(board, board.turn)
+    after = board.copy(stack=False)
+    after.push(move)
+    if not after.is_attacked_by(after.turn, move.to_square):
+        return None
+    candidates = []
+    for reply in after.generate_legal_captures():
+        if reply.to_square != move.to_square:
+            continue
+        reply_san = after.san(reply)
+        accepted = after.copy(stack=False)
+        accepted.push(reply)
+        balances = [_material_balance(accepted, piece.color)]
+        for recapture in accepted.generate_legal_captures():
+            if recapture.to_square == move.to_square:
+                recovered = accepted.copy(stack=False)
+                recovered.push(recapture)
+                balances.append(_material_balance(recovered, piece.color))
+        loss = before_balance - max(balances)
+        if loss >= 1:
+            candidates.append((loss, reply_san))
+    if not candidates:
+        return None
+    loss, reply_san = max(candidates)
+    return {"piece_type": piece.piece_type, "reply_san": reply_san,
+            "net_material_loss": loss}
+
+
 def classify_move(
     board: chess.Board, move: chess.Move, best_info: dict, played_info: dict,
     second_info: dict | None,
@@ -143,16 +183,28 @@ def classify_move(
     played_pv = played_info.get("pv", [])
     exact_best = bool(best_pv and best_pv[0] == move)
     offer = material_offer(board, move, played_pv)
+    possible_offer = available_material_offer(board, move) if offer is None else None
+    second_ep = expected_points(second_info, mover) if second_info else None
+    not_winning_without_move = (
+        best_ep < 0.90
+        or (played_score.mate() is not None and played_score.mate() > 0
+            and second_ep is not None and second_ep < 0.90)
+    )
+    sound_sacrifice = (
+        len(played_pv) >= 3
+        and ((offer is not None and offer["net_material_loss"] >= 1)
+             or (possible_offer is not None and possible_offer["net_material_loss"] >= 1))
+        and ep_loss <= 0.03 and played_ep >= 0.38 and not_winning_without_move
+    )
 
     if board.legal_moves.count() == 1:
         category = "forced"
     elif _is_book_move(board, move) and ep_loss <= 0.05:
         category = "book"
-    elif (ep_loss <= 0.02 and offer is not None and offer["net_material_loss"] >= 2
-          and played_ep >= 0.45 and best_ep < 0.90):
+    elif sound_sacrifice:
         category = "brilliant"
-    elif exact_best and second_info is not None and (
-        best_ep - expected_points(second_info, mover) >= 0.12
+    elif exact_best and second_ep is not None and (
+        best_ep - second_ep >= 0.12
     ) and played_ep >= 0.45 and best_ep < 0.98:
         category = "great"
     elif exact_best:
@@ -187,6 +239,7 @@ def classify_move(
         "best_ep": best_ep,
         "played_ep": played_ep,
         "material_offer": offer,
+        "available_material_offer": possible_offer,
     }
 
 

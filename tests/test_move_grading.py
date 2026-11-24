@@ -3,7 +3,7 @@ import unittest
 import chess
 import chess.engine
 
-from analysis_core import classify_move, material_offer
+from analysis_core import available_material_offer, classify_move, material_offer
 from coach import explain_move
 
 
@@ -73,6 +73,57 @@ class SacrificeGradingTests(unittest.TestCase):
         self.assertIn("Ng5+", explanation)
         self.assertIn("chiếu vua", explanation)
         self.assertIn("kém 2 điểm vật chất", explanation)
+
+    def test_declined_piece_offer_can_be_brilliant(self):
+        board = chess.Board("6k1/6pp/8/8/8/3B1N2/6PP/3Q2K1 w - - 0 1")
+        move = board.parse_san("Bxh7+")
+        after = board.copy()
+        after.push(move)
+        declined = after.parse_san("Kh8")
+        after.push(declined)
+        continuation = after.parse_san("Bg6")
+        pv = [move, declined, continuation]
+
+        self.assertIsNone(material_offer(board, move, pv))
+        self.assertEqual(2, available_material_offer(board, move)["net_material_loss"])
+        best = board.parse_san("Ng5")
+        assessment = classify_move(board, move, info([best], cp=20), info(pv), None)
+        self.assertEqual("brilliant", assessment["category"])
+        explanation = explain_move(board, move, assessment)
+        self.assertIn("Kxh7", explanation)
+        self.assertIn("không nhận quân", explanation)
+
+    def test_offered_piece_with_bad_engine_result_is_not_brilliant(self):
+        board = chess.Board("6k1/6pp/8/8/8/3B1N2/6PP/3Q2K1 w - - 0 1")
+        move = board.parse_san("Bxh7+")
+        after = board.copy()
+        after.push(move)
+        declined = after.parse_san("Kh8")
+        after.push(declined)
+        continuation = after.parse_san("Bg6")
+        pv = [move, declined, continuation]
+        best = board.parse_san("Ng5")
+        assessment = classify_move(board, move, info([best], cp=200),
+                                   info(pv, cp=-500), None)
+        self.assertNotEqual("brilliant", assessment["category"])
+
+    def test_mating_sacrifice_requires_a_weaker_alternative(self):
+        board = chess.Board("6k1/6pp/8/8/8/3B1N2/6PP/3Q2K1 w - - 0 1")
+        move = board.parse_san("Bxh7+")
+        after = board.copy()
+        after.push(move)
+        reply = after.parse_san("Kxh7")
+        after.push(reply)
+        pv = [move, reply, after.parse_san("Ng5+")]
+        mate_info = {"score": chess.engine.PovScore(chess.engine.Mate(3), chess.WHITE),
+                     "pv": pv}
+
+        critical = classify_move(board, move, mate_info, mate_info, info([board.parse_san("Ng5")]))
+        already_won = classify_move(board, move, mate_info, mate_info,
+                                    {"score": chess.engine.PovScore(chess.engine.Mate(7), chess.WHITE),
+                                     "pv": [board.parse_san("Ng5")]})
+        self.assertEqual("brilliant", critical["category"])
+        self.assertNotEqual("brilliant", already_won["category"])
 
 
 if __name__ == "__main__":

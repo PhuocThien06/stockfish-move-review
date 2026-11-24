@@ -95,6 +95,7 @@ def explain_move(board: chess.Board, move: chess.Move, assessment: dict, questio
     offer = assessment.get("material_offer") or material_offer(
         board, move, assessment["played_pv"]
     )
+    possible_offer = assessment.get("available_material_offer")
     question_lower = question.strip().casefold()
     parts = [f"Bruno · {san} — {label}."]
     facts = _observations(board, move)
@@ -106,7 +107,7 @@ def explain_move(board: chess.Board, move: chess.Move, assessment: dict, questio
     elif assessment["category"] == "forced":
         parts.append(f"Trước {san}, bạn chỉ có một nước hợp lệ. Vì thế nhãn là Forced Move.")
     elif assessment["category"] == "brilliant":
-        if offer and offer["net_material_loss"] >= 2:
+        if offer and offer["net_material_loss"] >= 1:
             piece_name = PIECE_NAMES[offer["piece_type"]]
             parts.append(
                 f"Đối phương có thể chơi {offer['reply_san']} để bắt {piece_name}. "
@@ -122,6 +123,16 @@ def explain_move(board: chess.Board, move: chess.Move, assessment: dict, questio
             elif offer["followup_capture_type"]:
                 captured = PIECE_NAMES[offer["followup_capture_type"]]
                 parts.append(f"Điểm bù đắp thấy ngay: {offer['followup_san']} bắt {captured}.")
+        elif possible_offer:
+            piece_name = PIECE_NAMES[possible_offer["piece_type"]]
+            parts.append(
+                f"Đối phương có thể nhận {piece_name} bằng {possible_offer['reply_san']}; "
+                f"dù tính cả khả năng bắt lại ngay trên ô đó, bạn vẫn mất ít nhất "
+                f"{possible_offer['net_material_loss']} điểm vật chất. "
+                "Trong biến thể mạnh nhất Stockfish lại không nhận quân này. "
+                "Nước thí vẫn giữ điểm kỳ vọng gần phương án tốt nhất; "
+                "hãy đi thử nước nhận quân trên bàn để xem đòn đáp cụ thể."
+            )
         else:
             parts.append(
                 "Biến thể này chưa chứng minh được thí quân thật; hãy phân tích sâu hơn "
