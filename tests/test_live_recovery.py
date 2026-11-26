@@ -2,8 +2,10 @@
 
 import sys
 import tempfile
+import time
 import tkinter as tk
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import patch
 
@@ -54,6 +56,15 @@ class LiveRecoveryTests(unittest.TestCase):
         self.app.live_selection_region = self.app.live_region
         self.app.live_game_path = self.old_pgn
 
+    def _complete_capture_tick(self) -> None:
+        task = self.app.live_processing
+        self.assertIsNotNone(task)
+        task.result(timeout=5)
+        if self.app.live_job is not None:
+            self.root.after_cancel(self.app.live_job)
+            self.app.live_job = None
+        self.app._capture_live_tick()
+
     @staticmethod
     def _screenshot(board: chess.Board, last: chess.Move) -> Image.Image:
         source = Image.new("RGB", (700, 700), "#14223b")
@@ -94,6 +105,7 @@ class LiveRecoveryTests(unittest.TestCase):
         self.app.live_stream = FakeStream()
         self.app.live_window = 1
         self.app._capture_live_tick()
+        self._complete_capture_tick()
         self.assertIsNotNone(self.app.live_tracker)
         self.assertFalse(self.app.live_stream.closed)
         self.assertEqual([], self.app.moves)
@@ -246,6 +258,7 @@ class LiveRecoveryTests(unittest.TestCase):
         self.app.live_stream = FakeStream()
         self.app.live_window = 1
         self.app._capture_live_tick()
+        self._complete_capture_tick()
         self.assertTrue(self.app.flipped)
         self.assertEqual(chess.STARTING_BOARD_FEN,
                          self.app.live_positions[-1].board_fen())
@@ -293,6 +306,7 @@ class LiveRecoveryTests(unittest.TestCase):
         self.app.live_window = 1
         self.app.live_recovery_after = 0
         self.app._capture_live_tick()
+        self._complete_capture_tick()
         self.assertFalse(self.app.live_turn_uncertain)
         self.assertEqual(shown.turn, self.app.positions[-1].turn)
         self.assertEqual(shown.board_fen(), self.app.positions[-1].board_fen())
@@ -306,6 +320,64 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertEqual(self.app.live_positions[-1].board_fen(),
                          self.app.positions[-1].board_fen())
         self.assertIn("Không lưu được PGN", self.app.live_status_var.get())
+
+    def test_slow_recovery_keeps_tk_event_loop_responsive(self) -> None:
+        self._setup_capture(chess.Board())
+        self.app.live_tracker.unmatched_frames = review.LIVE_RECOVERY_STABLE_FRAMES
+        source = Image.new("RGB", (700, 700), "#14223b")
+        source.paste(render(chess.Board()), (80, 80))
+
+        class FakeStream:
+            closed = False
+
+            def drain(self, _limit: int) -> list[Image.Image]:
+                return [source]
+
+            def close(self) -> None:
+                self.closed = True
+
+        self.app.live_stream = FakeStream()
+        self.app.live_window = 1
+
+        def slow_read(*_args):
+            time.sleep(0.25)
+            return None, []
+
+        with patch.object(review, "_read_live_recovery", side_effect=slow_read):
+            self.app._capture_live_tick()
+            started = time.perf_counter()
+            self.root.after(20, self.root.quit)
+            self.root.mainloop()
+            self.assertLess(time.perf_counter() - started, 0.15)
+            self._complete_capture_tick()
+
+    def test_background_move_result_updates_live_board(self) -> None:
+        board = chess.Board()
+        self._setup_capture(board)
+        move = board.parse_san("e4")
+
+        class FakeStream:
+            closed = False
+
+            def drain(self, _limit: int) -> list[Image.Image]:
+                return []
+
+            def close(self) -> None:
+                self.closed = True
+
+        self.app.live_stream = FakeStream()
+        self.app.live_window = 1
+        completed = Future()
+        completed.set_result([move])
+        self.app.live_processing = completed
+        self.app.live_processing_kind = "observe"
+        self.app.live_processing_tracker = self.app.live_tracker
+        self.app.live_processing_source = render(board)
+        self.app._capture_live_tick()
+
+        self.assertEqual([move], self.app.live_moves)
+        self.assertEqual("e4", board.san(move))
+        self.assertEqual(1, self.app.ply)
 
 
 if __name__ == "__main__":

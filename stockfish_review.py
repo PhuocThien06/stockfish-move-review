@@ -202,6 +202,118 @@ def compute_overview(
     return {"assessments": assessments, "total": len(moves)}
 
 
+def _observe_live_frame(
+    tracker: LiveBoardTracker, source: Image.Image,
+    region: tuple[int, int, int, int],
+) -> list[chess.Move]:
+    return tracker.observe(board_crop(source, region))
+
+
+def _read_live_recovery(
+    source: Image.Image,
+    selection: tuple[int, int, int, int],
+    region: tuple[int, int, int, int] | None,
+    tracker_flipped: bool,
+    tracker_turn: chess.Color,
+    current: chess.Board,
+    turn_uncertain: bool,
+) -> tuple[tuple | None, list[chess.Move]]:
+    """Read and reconcile a screenshot without touching Tk widgets."""
+
+    def position_rank(candidate: tuple) -> tuple:
+        _, board, _, source_flipped, turn_known = candidate
+        own_pawns = sum(
+            chess.square_rank(square) == (1 if piece.color else 6)
+            for square, piece in board.piece_map().items()
+            if piece.piece_type == chess.PAWN
+        )
+        mirrored_pawns = sum(
+            chess.square_rank(square) == (6 if piece.color else 1)
+            for square, piece in board.piece_map().items()
+            if piece.piece_type == chess.PAWN
+        )
+        own_kings = sum(
+            chess.square_rank(board.king(color)) == (0 if color else 7)
+            for color in (chess.WHITE, chess.BLACK)
+        )
+        return (board.board_fen() == current.board_fen(),
+                own_pawns - mirrored_pawns + 2 * own_kings,
+                turn_known, source_flipped == tracker_flipped)
+
+    def accept_position(aligned, board, frame, source_flipped):
+        inferred = infer_turn(frame, board, source_flipped)
+        turn_known = inferred is not None
+        if inferred is None:
+            if board.board_fen() == current.board_fen():
+                board.turn = current.turn
+                turn_known = not turn_uncertain
+        else:
+            board.turn = inferred
+        return ((aligned, board, frame, source_flipped, turn_known)
+                if board.is_valid() else None)
+
+    found = None
+    if region is not None:
+        try:
+            frame = board_crop(source, region)
+        except ValueError:
+            pass
+        else:
+            candidates = []
+            for source_flipped in (tracker_flipped, not tracker_flipped):
+                for turn in (tracker_turn, not tracker_turn):
+                    try:
+                        board = recognize_board(frame, source_flipped, turn, robust=True)
+                    except ValueError:
+                        continue
+                    candidate = accept_position(region, board, frame, source_flipped)
+                    if candidate is not None:
+                        candidates.append(candidate)
+                        break
+            if candidates:
+                found = max(candidates, key=position_rank)
+    if found is None:
+        candidates = []
+        for source_flipped in (tracker_flipped, not tracker_flipped):
+            for turn in (tracker_turn, not tracker_turn):
+                try:
+                    aligned, board, frame = align_board(source, selection,
+                                                        source_flipped, turn)
+                except ValueError:
+                    continue
+                candidate = accept_position(aligned, board, frame, source_flipped)
+                if candidate is not None:
+                    candidates.append(candidate)
+                    break
+        if candidates:
+            found = max(candidates, key=position_rank)
+    if found is None:
+        return None, []
+
+    _, board, _, source_flipped, turn_known = found
+    matches: list[list[chess.Move]] = []
+    if (board.board_fen() != current.board_fen()
+            and turn_known and source_flipped == tracker_flipped):
+        probe = current.copy(stack=False)
+        target = board.piece_map()
+        if board.turn != current.turn:
+            for move in list(probe.legal_moves):
+                probe.push(move)
+                if probe.piece_map() == target:
+                    matches.append([move])
+                probe.pop()
+        else:
+            for first in list(probe.legal_moves):
+                probe.push(first)
+                for second in list(probe.legal_moves):
+                    probe.push(second)
+                    if probe.piece_map() == target:
+                        matches.append([first, second])
+                    probe.pop()
+                probe.pop()
+    return found, matches[0] if len(matches) == 1 else []
+
+
 class ChessReviewApp:
     def __init__(self, root: tk.Tk) -> None:
         global SQUARE, BOARD_SIZE
@@ -257,6 +369,7 @@ class ChessReviewApp:
         self.overview_executor = ThreadPoolExecutor(max_workers=1)
         self.sync_executor = ThreadPoolExecutor(max_workers=1)
         self.opening_executor = ThreadPoolExecutor(max_workers=2)
+        self.live_executor = ThreadPoolExecutor(max_workers=1)
         self.opening_guide_future = self.opening_executor.submit(get_opening_guide)
         self.opening_guide_ready = False
         self.opening_results: queue.Queue[tuple[int, Future]] = queue.Queue()
@@ -301,6 +414,10 @@ class ChessReviewApp:
         self.live_region: tuple[int, int, int, int] | None = None
         self.live_selection_region: tuple[int, int, int, int] | None = None
         self.live_job: str | None = None
+        self.live_processing: Future | None = None
+        self.live_processing_kind = ""
+        self.live_processing_source: Image.Image | None = None
+        self.live_processing_tracker: LiveBoardTracker | None = None
         self.live_recovery_after = 0.0
         self.live_game_path: Path | None = None
         self.live_window_title = ""
@@ -971,129 +1088,101 @@ class ChessReviewApp:
         self.live_job = self.root.after(60, self._capture_live_tick)
 
     def _capture_live_tick(self) -> None:
+        """Keep image recognition off the Tk event loop."""
         self.live_job = None
         tracker = self.live_tracker
         if (tracker is None or self.live_stream is None
                 or self.live_window is None or self.live_region is None):
+            return
+        task = self.live_processing
+        if task is not None:
+            if not task.done():
+                self.live_job = self.root.after(30, self._capture_live_tick)
+                return
+            kind = self.live_processing_kind
+            source = self.live_processing_source
+            task_tracker = self.live_processing_tracker
+            self.live_processing = None
+            self.live_processing_kind = ""
+            self.live_processing_source = None
+            self.live_processing_tracker = None
+            if task_tracker is tracker:
+                try:
+                    result = task.result()
+                    if kind == "recovery":
+                        self._recover_live_position(source, result)
+                    else:
+                        for move in result:
+                            self._apply_live_move(move)
+                            if self.live_tracker is None:
+                                return
+                except OSError as exc:
+                    self._stop_live_capture()
+                    self.live_status_var.set(f"Đã dừng: {exc}")
+                    return
+                except (ValueError, TimeoutError) as exc:
+                    self.live_status_var.set(
+                        f"Ảnh bàn cờ tạm thời chưa đọc được: {exc}. Đang thử tiếp…")
+                except Exception as exc:
+                    self.live_status_var.set(f"Không xử lý được ảnh: {exc}. Đang thử tiếp…")
+            if self.live_tracker is not None:
+                self.live_job = self.root.after(20, self._capture_live_tick)
             return
         try:
             if self.live_stream.closed:
                 raise OSError("Cửa sổ nguồn đã đóng.")
             frames = self.live_stream.drain(128)
             source = frames[-1] if frames else self.live_stream.latest()
-            if self.live_turn_uncertain:
-                if time.monotonic() >= self.live_recovery_after:
-                    self.live_recovery_after = time.monotonic() + 0.7
-                    self._recover_live_position(source)
-                if self.live_tracker is not None:
-                    self.live_job = self.root.after(120, self._capture_live_tick)
+            now = time.monotonic()
+            recovering = self.live_turn_uncertain or (
+                tracker.unmatched_frames >= LIVE_RECOVERY_STABLE_FRAMES
+                and now >= self.live_recovery_after)
+            if self.live_turn_uncertain and now < self.live_recovery_after:
+                self.live_job = self.root.after(120, self._capture_live_tick)
                 return
-            frame = board_crop(source, self.live_region)
-            for move in tracker.observe(frame):
-                self._apply_live_move(move)
-                if self.live_tracker is None:
+            if recovering:
+                self.live_recovery_after = now + (0.7 if self.live_turn_uncertain else 2.0)
+                selection = self.live_selection_region or self.live_region
+                if self.live_positions is None:
                     return
-                if tracker.unmatched_frames >= LIVE_RECOVERY_STABLE_FRAMES:
-                    break
+                self.live_processing = self.live_executor.submit(
+                    _read_live_recovery, source, selection, self.live_region,
+                    tracker.flipped, tracker.board.turn,
+                    self.live_positions[-1].copy(stack=False),
+                    self.live_turn_uncertain,
+                )
+                self.live_processing_kind = "recovery"
+            else:
+                self.live_processing = self.live_executor.submit(
+                    _observe_live_frame, tracker, source, self.live_region)
+                self.live_processing_kind = "observe"
+            self.live_processing_source = source
+            self.live_processing_tracker = tracker
         except OSError as exc:
             self._stop_live_capture()
             self.live_status_var.set(f"Đã dừng: {exc}")
             return
         except (ValueError, TimeoutError) as exc:
             self.live_status_var.set(f"Ảnh bàn cờ tạm thời chưa đọc được: {exc}. Đang thử tiếp…")
-            if self.live_tracker is not None:
-                self.live_job = self.root.after(180, self._capture_live_tick)
+            self.live_job = self.root.after(180, self._capture_live_tick)
             return
-        if (tracker.unmatched_frames >= LIVE_RECOVERY_STABLE_FRAMES
-                and time.monotonic() >= self.live_recovery_after):
-            self.live_recovery_after = time.monotonic() + 2.0
-            self._recover_live_position(source)
-        if self.live_tracker is not None:
-            self.live_job = self.root.after(60, self._capture_live_tick)
+        self.live_job = self.root.after(30, self._capture_live_tick)
 
-    def _recover_live_position(self, source) -> None:
+    def _recover_live_position(self, source, prepared: tuple | None = None) -> None:
         """Rebase on a verified current board instead of ending live capture."""
         tracker = self.live_tracker
         selection = self.live_selection_region or self.live_region
         if tracker is None or selection is None or self.live_positions is None:
             return
         live_positions = self.live_positions
-        found = None
-
-        def position_rank(candidate):
-            _, board, _, source_flipped, turn_known = candidate
-            # A mirrored opening can still pass python-chess legality checks.
-            # Pawns on their own home rank and kings on their own back rank
-            # distinguish the real orientation before a new game's first move.
-            own_pawns = sum(
-                chess.square_rank(square) == (1 if piece.color else 6)
-                for square, piece in board.piece_map().items()
-                if piece.piece_type == chess.PAWN
+        if prepared is None:
+            found, recovered = _read_live_recovery(
+                source, selection, self.live_region, tracker.flipped,
+                tracker.board.turn, live_positions[-1].copy(stack=False),
+                self.live_turn_uncertain,
             )
-            mirrored_pawns = sum(
-                chess.square_rank(square) == (6 if piece.color else 1)
-                for square, piece in board.piece_map().items()
-                if piece.piece_type == chess.PAWN
-            )
-            own_kings = sum(
-                chess.square_rank(board.king(color)) == (0 if color else 7)
-                for color in (chess.WHITE, chess.BLACK)
-            )
-            return (board.board_fen() == live_positions[-1].board_fen(),
-                    own_pawns - mirrored_pawns + 2 * own_kings,
-                    turn_known,
-                    source_flipped == tracker.flipped)
-
-        def accept_position(aligned, board, frame, source_flipped):
-            inferred = infer_turn(frame, board, source_flipped)
-            turn_known = inferred is not None
-            if inferred is None:
-                if board.board_fen() == live_positions[-1].board_fen():
-                    board.turn = live_positions[-1].turn
-                    turn_known = not self.live_turn_uncertain
-            else:
-                board.turn = inferred
-            return ((aligned, board, frame, source_flipped, turn_known)
-                    if board.is_valid() else None)
-
-        # Most missed moves leave the board in the same on-screen location.
-        # Reading the already-aligned region takes a fraction of a second;
-        # searching nearby crops is needed only if the window layout changed.
-        if self.live_region is not None:
-            try:
-                frame = board_crop(source, self.live_region)
-            except ValueError:
-                pass
-            else:
-                candidates = []
-                for source_flipped in (tracker.flipped, not tracker.flipped):
-                    for turn in (tracker.board.turn, not tracker.board.turn):
-                        try:
-                            board = recognize_board(frame, source_flipped, turn, robust=True)
-                        except ValueError:
-                            continue
-                        candidate = accept_position(self.live_region, board, frame,
-                                                    source_flipped)
-                        if candidate is not None:
-                            candidates.append(candidate)
-                            break
-                if candidates:
-                    found = max(candidates, key=position_rank)
-        if found is None:
-            candidates = []
-            for source_flipped in (tracker.flipped, not tracker.flipped):
-                for turn in (tracker.board.turn, not tracker.board.turn):
-                    try:
-                        aligned, board, frame = align_board(source, selection,
-                                                            source_flipped, turn)
-                    except ValueError:
-                        continue
-                    candidate = accept_position(aligned, board, frame, source_flipped)
-                    if candidate is not None:
-                        candidates.append(candidate)
-                        break
-            if candidates:
-                found = max(candidates, key=position_rank)
+        else:
+            found, recovered = prepared
         if found is None:
             self.live_status_var.set("Ảnh chưa đủ rõ hoặc chưa xác định được lượt đi; "
                                      "vẫn đang theo dõi và sẽ thử lại khi bàn cờ ổn định.")
@@ -1127,31 +1216,8 @@ class ChessReviewApp:
                 "Đã đọc lại bàn cờ; vị trí quân khớp PGN, tiếp tục theo dõi."
             )
             return
-        # A clearer crop can reveal one or two moves that the earlier crop
-        # missed. Reconcile them before starting a separate PGN segment.
-        current = live_positions[-1]
-        matches: list[list[chess.Move]] = []
-        probe = current.copy(stack=False)
-        target = board.piece_map()
-        if not turn_known or source_flipped != tracker.flipped:
-            matches = []
-        elif board.turn != current.turn:
-            for move in list(probe.legal_moves):
-                probe.push(move)
-                if probe.piece_map() == target:
-                    matches.append([move])
-                probe.pop()
-        else:
-            for first in list(probe.legal_moves):
-                probe.push(first)
-                for second in list(probe.legal_moves):
-                    probe.push(second)
-                    if probe.piece_map() == target:
-                        matches.append([first, second])
-                    probe.pop()
-                probe.pop()
-        if len(matches) == 1:
-            recovered = matches[0]
+        # The worker reconciled one or two missing plies when possible.
+        if recovered:
             for move in recovered:
                 self._apply_live_move(move)
                 if self.live_tracker is None:
@@ -1259,6 +1325,12 @@ class ChessReviewApp:
         if self.live_job is not None:
             self.root.after_cancel(self.live_job)
             self.live_job = None
+        if self.live_processing is not None:
+            self.live_processing.cancel()
+            self.live_processing = None
+        self.live_processing_kind = ""
+        self.live_processing_source = None
+        self.live_processing_tracker = None
         if self.live_tracker is None:
             return
         count = len(self.live_moves or [])
@@ -3062,6 +3134,7 @@ class ChessReviewApp:
         self.overview_executor.shutdown(wait=False, cancel_futures=True)
         self.sync_executor.shutdown(wait=False, cancel_futures=True)
         self.opening_executor.shutdown(wait=False, cancel_futures=True)
+        self.live_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 
